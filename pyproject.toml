@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=70.1"]  # setuptools.command.bdist_wheel
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wgpkernels"
+dynamic = ["version"]  # setup.py: wgpkernels.__version__, plus the CUDA variant of the bundled library
+description = "GPU kernels for WanGP: INT8 weight linears for Quanto INT8 and ConvRot checkpoints"
+requires-python = ">=3.10"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+authors = [{name = "DeepBeepMeep"}]
+classifiers = ["License :: OSI Approved :: Apache Software License", "Programming Language :: Python :: 3", "Operating System :: Microsoft :: Windows",
+               "Operating System :: POSIX :: Linux", "Environment :: GPU :: NVIDIA CUDA"]
+dependencies = ["torch"]
+
+[tool.setuptools.packages.find]
+include = ["wgpkernels*"]
+
+[tool.setuptools.package-data]
+"wgpkernels.int8" = ["*.cu", "*.dll", "*.so"]
