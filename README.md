@@ -42,8 +42,8 @@ reach 7-13%.
 - Driver: R570 or newer for the CUDA 12.8 builds (`+cu128`), R580 or newer for the CUDA 13 builds (`+cu130`).
 - Linux: glibc 2.34 or newer (Ubuntu 22.04, Debian 12, RHEL 9 or later).
 
-Native code is included for SM80, 86, 89, 90, 100 and 120, plus PTX that newer GPUs compile on first use. Validation was performed on
-an RTX 5090; on other GPUs, run `selftest()` (WanGP does it before selecting the kernels).
+Source builds include every base SM80+ target supported by the selected CUDA toolkit, plus PTX for its newest target.
+Validation was performed on an RTX 5090; on other GPUs, run `selftest()` (WanGP does it before selecting the INT8 kernels).
 
 **AMD (experimental)**: a HIP build for RDNA4 (RX 9070 series, `gfx1201`) on Windows with ROCm PyTorch 2.10.0+rocm7.14.0. The INT8 GEMM
 uses rocWMMA (row, `exact` and `block` modes as whole tiles, without the split-K schedule) and the few-token paths are CUDA-core GEMVs
@@ -56,13 +56,13 @@ Pick the wheel matching your platform and CUDA stack. A wheel serves every Pytho
 
 ```bash
 # Windows, PyTorch with CUDA 13 (e.g. PyTorch 2.10)
-pip install https://github.com/deepbeepmeep/kernels/releases/download/wgpkernels-v1.0.0/wgpkernels-1.0.0%2Bcu130-py3-none-win_amd64.whl
+pip install https://github.com/deepbeepmeep/kernels/releases/download/wgpkernels-v1.1.0/wgpkernels-1.1.0%2Bcu130-py3-none-win_amd64.whl
 # Windows, PyTorch with CUDA 12.8 (e.g. PyTorch 2.7.1)
-pip install https://github.com/deepbeepmeep/kernels/releases/download/wgpkernels-v1.0.0/wgpkernels-1.0.0%2Bcu128-py3-none-win_amd64.whl
+pip install https://github.com/deepbeepmeep/kernels/releases/download/wgpkernels-v1.1.0/wgpkernels-1.1.0%2Bcu128-py3-none-win_amd64.whl
 # Linux, PyTorch with CUDA 13
-pip install https://github.com/deepbeepmeep/kernels/releases/download/wgpkernels-v1.0.0/wgpkernels-1.0.0%2Bcu130-py3-none-linux_x86_64.whl
+pip install https://github.com/deepbeepmeep/kernels/releases/download/wgpkernels-v1.1.0/wgpkernels-1.1.0%2Bcu130-py3-none-linux_x86_64.whl
 # Linux, PyTorch with CUDA 12.8
-pip install https://github.com/deepbeepmeep/kernels/releases/download/wgpkernels-v1.0.0/wgpkernels-1.0.0%2Bcu128-py3-none-linux_x86_64.whl
+pip install https://github.com/deepbeepmeep/kernels/releases/download/wgpkernels-v1.1.0/wgpkernels-1.1.0%2Bcu128-py3-none-linux_x86_64.whl
 # Windows, AMD RX 9070 with PyTorch 2.10.0+rocm7.14.0 (experimental)
 pip install https://github.com/deepbeepmeep/kernels/releases/download/wgpkernels-v1.0.0/wgpkernels-1.0.0%2Brocm714-py3-none-win_amd64.whl
 ```
@@ -96,10 +96,62 @@ thresholds replace the timing.
 
 ## Building from source
 
+### Activation and convolution library
+
+`wgpkernels.ops` supplies independent CUDA implementations of AdaLN (LayerNorm
+followed by scale and shift), channel PixelNorm followed by SiLU, and valid
+stride-one Conv3D. It does not depend on Comfy Kitchen or Triton. Build it with
+`python -m wgpkernels.build --library ops`; the INT8 library is built separately.
+
+```python
+from wgpkernels import ops
+ops.load_library()
+with torch.inference_mode():
+    y = ops.adaln(x, scale, shift, eps=1e-6)
+    # Five-dimensional B,C,T,H,W activations:
+    y = ops.pixel_norm_silu(video, eps=1e-6)
+    y = ops.conv3d(padded_video, weight, bias)
+```
+
+The operations accept FP16/BF16 CUDA tensors, use the current stream and support
+CUDA graph capture after library loading. AdaLN accepts contiguous 2-D/3-D rows
+and broadcast modulation with contiguous channels. PixelNorm accepts strided
+inputs and returns channels-last-3d. Conv3D requires channel counts divisible by
+32; it converts inputs/weights to channels-last when needed, uses implicit GEMM
+without an im2col buffer, and returns channels-last-3d. No weights or activations
+are cached. Callers own padding, temporal history and module hooks.
+
+The configurable ops library (`wgp_ops_v2.dll` / `libwgp_ops_v2.so`) tunes native
+CUDA configurations on first eager use, like the INT8 kernels. It compares
+AdaLN block sizes, PixelNorm channel/thread groupings and Conv3D tiles without
+changing providers. Measurements reuse the required output buffer; inputs and
+weights remain read-only. Winners and timing metadata are saved in
+`~/.triton/autotune/wgpkernels_ops.json` by GPU, dtype, geometry and layout.
+`WGPKERNELS_OPS_CACHE` can select a different cache file. No GPU tensors, modules
+or callbacks are kept in that cache. The cache version changes with the kernels,
+candidate configurations or timing method.
+
+Warm up before graph capture. A capture-time cache miss uses the baseline without
+tuning or saving that temporary choice; a later eager call can still tune it.
+Candidate configurations preserve the original reduction trees and rounding.
+For diagnostics, `config=0` forces the original CUDA configuration. An older ops
+library remains usable with its fixed configurations.
+
+Statistics and convolution accumulate in FP32. AdaLN and PixelNorm retain their
+PyTorch intermediate rounding points; parallel reduction order may differ.
+Conv3D rounds its FP32 sum to the activation dtype before adding bias, matching
+the established WanGP convolution epilogue. These APIs do not silently select
+other providers. WanGP controls availability, precision eligibility and its
+independent Triton/PyTorch fallbacks. The ops library uses NVIDIA WMMA and has no
+HIP build; the existing INT8 HIP library is unchanged.
+
+### Toolchain
+
 Requirements: CUDA toolkit 12.8 or newer, and MSVC (Windows, found automatically through `vswhere`) or gcc (Linux).
 
 ```bash
-python -m wgpkernels.build                       # all architectures (80,86,89,90,100,120) into wgpkernels/int8/
+python -m wgpkernels.build                       # every toolkit-supported SM80+ target into wgpkernels/int8/
+python -m wgpkernels.build --library ops         # same targets for activation/convolution kernels
 python -m wgpkernels.build --arch 120 --verbose  # one architecture, with register and spill report
 python -m wgpkernels.build --hip <ROCm SDK root> # AMD gfx1201 with the SDK's hipcc (e.g. ROCm 7.14's _rocm_sdk_devel)
 pip install -e .                                 # editable install using the library built in place

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "wgpkernels"
 dynamic = ["version"]  # setup.py: wgpkernels.__version__, plus the CUDA variant of the bundled library
-description = "GPU kernels for WanGP: INT8 weight linears for Quanto INT8 and ConvRot checkpoints"
+description = "GPU kernels for WanGP: INT8 linears, normalization and convolution"
 requires-python = ">=3.10"
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -19,3 +19,4 @@ include = ["wgpkernels*"]
 
 [tool.setuptools.package-data]
 "wgpkernels.int8" = ["*.cu", "*.dll", "*.so"]
+"wgpkernels.ops" = ["*.cu", "*.dll", "*.so"]

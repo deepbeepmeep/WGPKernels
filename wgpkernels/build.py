@@ -4,6 +4,7 @@ python -m wgpkernels.build [--library int8] [--arch 120] [--output PATH] [--verb
 AMD (HIP): python -m wgpkernels.build --hip <ROCm SDK root, holding bin/hipcc> [--arch gfx1201]"""
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -11,15 +12,16 @@ from pathlib import Path
 
 PACKAGE = Path(__file__).resolve().parent
 # SASS for every listed architecture plus PTX for the newest, so later GPUs JIT once.
-DEFAULT_ARCHS = "80,86,89,90,100,120"
+DEFAULT_ARCHS = "all"
 DEFAULT_HIP_ARCHS = "gfx1201"  # RDNA4 (RX 9070): the AMD targets need rocWMMA's gfx12 WMMA
 # library name -> CUDA source, relative to the package
-LIBRARIES = {"int8": "int8/int8_gemm.cu"}
+LIBRARIES = {"int8": "int8/int8_gemm.cu", "ops": "ops/ops.cu"}
 
 
 def library_file(name):
     source = PACKAGE / LIBRARIES[name]
-    return source.with_name(f"wgp_{name}.dll" if os.name == "nt" else f"libwgp_{name}.so")
+    binary_name = 'ops_v2' if name == 'ops' else name
+    return source.with_name(f"wgp_{binary_name}.dll" if os.name == "nt" else f"libwgp_{binary_name}.so")
 
 
 def _msvc_environment():
@@ -40,6 +42,9 @@ def _msvc_environment():
 
 
 def build(name="int8", archs=DEFAULT_ARCHS, output=None, nvcc="nvcc", verbose=False):
+    if archs == "all":
+        codes = subprocess.check_output([nvcc, "--list-gpu-code"], text=True)
+        archs = ",".join(code for code in re.findall(r"^sm_(\d+)$", codes, re.MULTILINE) if int(code) >= 80)
     archs = sorted({int(a) for a in str(archs).split(",")})
     target = Path(output or library_file(name)).resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -60,6 +65,8 @@ def build(name="int8", archs=DEFAULT_ARCHS, output=None, nvcc="nvcc", verbose=Fa
 
 def build_hip(name="int8", archs=DEFAULT_HIP_ARCHS, output=None, rocm=None, verbose=False):
     """HIP build with the ROCm SDK's hipcc (one --offload-arch per GPU); the library links the HIP runtime that ROCm PyTorch loads."""
+    if name == "ops":
+        raise ValueError("The ops library uses NVIDIA WMMA; use the independent Triton/PyTorch operations on HIP")
     rocm = Path(rocm)
     target = Path(output or library_file(name)).resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -82,7 +89,7 @@ def build_hip(name="int8", archs=DEFAULT_HIP_ARCHS, output=None, rocm=None, verb
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--library", default="int8", choices=sorted(LIBRARIES))
-    parser.add_argument("--arch", default=None, help="comma separated SM versions (CUDA) or gfx targets (HIP)")
+    parser.add_argument("--arch", default=None, help="all supported SM80+ targets (default), comma separated SM versions (CUDA), or gfx targets (HIP)")
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--nvcc", default="nvcc")
     parser.add_argument("--hip", default=None, help="ROCm SDK root: build for AMD GPUs with its hipcc")
