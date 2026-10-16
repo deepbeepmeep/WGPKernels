@@ -62,17 +62,17 @@ Pick the wheel matching your platform and CUDA stack. A wheel serves every Pytho
 
 ```bash
 # Windows, PyTorch with CUDA 13 (e.g. PyTorch 2.10)
-pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.1.1/wgpkernels-1.1.1%2Bcu130-py3-none-win_amd64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.1.2/wgpkernels-1.1.2%2Bcu130-py3-none-win_amd64.whl
 # Windows, PyTorch with CUDA 12.8 (e.g. PyTorch 2.7.1)
-pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.1.1/wgpkernels-1.1.1%2Bcu128-py3-none-win_amd64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.1.2/wgpkernels-1.1.2%2Bcu128-py3-none-win_amd64.whl
 # Linux, PyTorch with CUDA 13
-pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.1.1/wgpkernels-1.1.1%2Bcu130-py3-none-linux_x86_64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.1.2/wgpkernels-1.1.2%2Bcu130-py3-none-linux_x86_64.whl
 # Linux, PyTorch with CUDA 12.8
-pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.1.1/wgpkernels-1.1.1%2Bcu128-py3-none-linux_x86_64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.1.2/wgpkernels-1.1.2%2Bcu128-py3-none-linux_x86_64.whl
 # Windows, AMD RDNA4 with PyTorch 2.13.0 / ROCm 10.0 (experimental)
-pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.1.1/wgpkernels-1.1.1%2Brocm100-py3-none-win_amd64.whl
+pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.1.2/wgpkernels-1.1.2%2Brocm100-py3-none-win_amd64.whl
 # Linux, AMD RDNA4 with PyTorch 2.13.0 / ROCm 10.0 (experimental)
-pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.1.1/wgpkernels-1.1.1%2Brocm100-py3-none-linux_x86_64.whl
+pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.1.2/wgpkernels-1.1.2%2Brocm100-py3-none-linux_x86_64.whl
 ```
 
 ## Usage
