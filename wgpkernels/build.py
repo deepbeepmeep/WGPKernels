@@ -13,7 +13,7 @@ from pathlib import Path
 PACKAGE = Path(__file__).resolve().parent
 # SASS for every listed architecture plus PTX for the newest, so later GPUs JIT once.
 DEFAULT_ARCHS = "all"
-DEFAULT_HIP_ARCHS = "gfx1201"  # RDNA4 (RX 9070): the AMD targets need rocWMMA's gfx12 WMMA
+DEFAULT_HIP_ARCHS = "gfx1200,gfx1201"  # RDNA4: the AMD targets need rocWMMA's gfx12 WMMA
 # library name -> CUDA source, relative to the package
 LIBRARIES = {"int8": "int8/int8_gemm.cu", "ops": "ops/ops.cu"}
 

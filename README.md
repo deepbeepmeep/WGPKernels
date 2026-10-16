@@ -45,10 +45,10 @@ reach 7-13%.
 Source builds include every base SM80+ target supported by the selected CUDA toolkit, plus PTX for its newest target.
 Validation was performed on an RTX 5090; on other GPUs, run `selftest()` (WanGP does it before selecting the INT8 kernels).
 
-**AMD (experimental)**: a HIP build for RDNA4 (RX 9070 series, `gfx1201`) on Windows with ROCm PyTorch 2.10.0+rocm7.14.0. The INT8 GEMM
-uses rocWMMA (row, `exact` and `block` modes as whole tiles, without the split-K schedule) and the few-token paths are CUDA-core GEMVs
-with FP32 accumulation, so precision matches the NVIDIA paths. It was compiled and loaded without an AMD GPU: its kernels have not run
-on AMD hardware yet, so `selftest()` decides whether they can be used.
+**AMD (experimental)**: a HIP build for RDNA4 (`gfx1200`, `gfx1201`) on Windows and Linux with PyTorch 2.13.0 / ROCm 10.0. The INT8 GEMM
+uses rocWMMA (row, `exact` and `block` modes as whole tiles, without the split-K schedule); the few-token paths use GEMV with FP32
+accumulation. Both wheels pass installation and library-loading checks. AMD kernel execution, numerical precision, speed, memory
+usage and graph replay remain unvalidated, so `selftest()` decides whether the kernels can be used.
 
 ## Installation
 
@@ -63,8 +63,10 @@ pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.1.1/
 pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.1.1/wgpkernels-1.1.1%2Bcu130-py3-none-linux_x86_64.whl
 # Linux, PyTorch with CUDA 12.8
 pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.1.1/wgpkernels-1.1.1%2Bcu128-py3-none-linux_x86_64.whl
-# Windows, AMD RX 9070 with PyTorch 2.10.0+rocm7.14.0 (experimental)
-pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.1.1/wgpkernels-1.1.1%2Brocm714-py3-none-win_amd64.whl
+# Windows, AMD RDNA4 with PyTorch 2.13.0 / ROCm 10.0 (experimental)
+pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.1.1/wgpkernels-1.1.1%2Brocm100-py3-none-win_amd64.whl
+# Linux, AMD RDNA4 with PyTorch 2.13.0 / ROCm 10.0 (experimental)
+pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.1.1/wgpkernels-1.1.1%2Brocm100-py3-none-linux_x86_64.whl
 ```
 
 ## Usage
@@ -153,7 +155,7 @@ Requirements: CUDA toolkit 12.8 or newer, and MSVC (Windows, found automatically
 python -m wgpkernels.build                       # every toolkit-supported SM80+ target into wgpkernels/int8/
 python -m wgpkernels.build --library ops         # same targets for activation/convolution kernels
 python -m wgpkernels.build --arch 120 --verbose  # one architecture, with register and spill report
-python -m wgpkernels.build --hip <ROCm SDK root> # AMD gfx1201 with the SDK's hipcc (e.g. ROCm 7.14's _rocm_sdk_devel)
+python -m wgpkernels.build --hip <ROCm SDK root> # AMD gfx1200 and gfx1201 with ROCm 10's hipcc
 pip install -e .                                 # editable install using the library built in place
 ```
 
