@@ -56,15 +56,15 @@ Pick the wheel matching your platform and CUDA stack. A wheel serves every Pytho
 
 ```bash
 # Windows, PyTorch with CUDA 13 (e.g. PyTorch 2.10)
-pip install https://github.com/deepbeepmeep/kernels/releases/download/wgpkernels-v1.1.0/wgpkernels-1.1.0%2Bcu130-py3-none-win_amd64.whl
+pip install https://github.com/deepbeepmeep/kernels/releases/download/wgpkernels-v1.1.1/wgpkernels-1.1.1%2Bcu130-py3-none-win_amd64.whl
 # Windows, PyTorch with CUDA 12.8 (e.g. PyTorch 2.7.1)
-pip install https://github.com/deepbeepmeep/kernels/releases/download/wgpkernels-v1.1.0/wgpkernels-1.1.0%2Bcu128-py3-none-win_amd64.whl
+pip install https://github.com/deepbeepmeep/kernels/releases/download/wgpkernels-v1.1.1/wgpkernels-1.1.1%2Bcu128-py3-none-win_amd64.whl
 # Linux, PyTorch with CUDA 13
-pip install https://github.com/deepbeepmeep/kernels/releases/download/wgpkernels-v1.1.0/wgpkernels-1.1.0%2Bcu130-py3-none-linux_x86_64.whl
+pip install https://github.com/deepbeepmeep/kernels/releases/download/wgpkernels-v1.1.1/wgpkernels-1.1.1%2Bcu130-py3-none-linux_x86_64.whl
 # Linux, PyTorch with CUDA 12.8
-pip install https://github.com/deepbeepmeep/kernels/releases/download/wgpkernels-v1.1.0/wgpkernels-1.1.0%2Bcu128-py3-none-linux_x86_64.whl
+pip install https://github.com/deepbeepmeep/kernels/releases/download/wgpkernels-v1.1.1/wgpkernels-1.1.1%2Bcu128-py3-none-linux_x86_64.whl
 # Windows, AMD RX 9070 with PyTorch 2.10.0+rocm7.14.0 (experimental)
-pip install https://github.com/deepbeepmeep/kernels/releases/download/wgpkernels-v1.0.0/wgpkernels-1.0.0%2Brocm714-py3-none-win_amd64.whl
+pip install https://github.com/deepbeepmeep/kernels/releases/download/wgpkernels-v1.1.1/wgpkernels-1.1.1%2Brocm714-py3-none-win_amd64.whl
 ```
 
 ## Usage
