@@ -25,6 +25,12 @@ GPU, so it is timed once per GPU, layer shape and token-count bucket, and cached
 `precise=True` keeps a full-precision path at every length, for layers whose activations need it (for example language models with
 massive activations).
 
+Autotuning prints a start message and the selected choice, without listing candidate timings or nested tile searches. Cache hits are
+silent and survive restarts. INT8 path selection uses exact token counts through 16, groups of 8 through 128, then groups of 64 through
+4096. GEMM tile selection uses groups of 64 through 4096, then buckets of 8192 and 16384; larger inputs reuse the 16384 bucket. Layer
+widths remain distinct, and path choices also distinguish ConvRot groups, fused input operations and `precise=True`. In ordinary mode,
+inputs above 4096 tokens use `block` directly. The first input in a bucket supplies the measurements reused for that bucket.
+
 Fusions, available on every path and computed in FP32 with a single final rounding:
 - input operation applied while the activation is quantized: `act="rms_norm"` (optional weight) or `act="swiglu"` (rows `[gate | value]`);
 - residual epilogue: `Y = residual + residual_scale * (X @ W.T + bias)`, optionally written in place of the residual;

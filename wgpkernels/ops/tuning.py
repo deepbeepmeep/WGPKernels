@@ -82,6 +82,7 @@ def choose(operation, identity, device_index, candidates, launch):
             best = entry['config']
         else:
             started = time.perf_counter()
+            print(f'[WGPKernels] Autotuning CUDA {operation}...', flush=True)
             timings = {config: float('inf') for config in candidates}
             for config in candidates:
                 launch(config)
@@ -102,7 +103,7 @@ def choose(operation, identity, device_index, candidates, launch):
                 best = candidates[0]
             _entries[stored_key] = {'config': best, 'milliseconds': timings}
             _save()
-            print(f'[Kernels] Tuned CUDA {operation} in {time.perf_counter() - started:.2f} s: configuration {best} ({timings[best] * 1000:.1f} us).')
+            print(f'[WGPKernels] Selected CUDA {operation}: configuration {best} ({timings[best] * 1000:.1f} us; tuned in {time.perf_counter() - started:.2f} s).', flush=True)
         if len(_plans) >= MAX_ENTRIES:
             _plans.clear()
         _plans[key] = best

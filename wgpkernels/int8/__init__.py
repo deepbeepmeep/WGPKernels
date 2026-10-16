@@ -26,6 +26,7 @@ import functools
 import json
 import os
 import time
+from contextvars import ContextVar
 from pathlib import Path
 
 import torch
@@ -151,6 +152,7 @@ _MODES = {0: 'row', 2: 'row', 6: 'row', 1: 'exact', 7: 'exact', 10: 'block', 11:
 _TUNING_VERSION = 11
 _TUNING_PATH = Path.home() / ".triton" / "autotune" / "wgpkernels_int8.json"
 _tuned = None
+_path_tuning = ContextVar("wgpkernels_int8_path_tuning", default=False)
 
 
 @functools.cache
@@ -225,12 +227,17 @@ def _tuned_config(a, a_lo, sa, b, sb, bias, y, mode):
             return _CANDIDATES[mode][0], False
         return (_lib.wq8_gemm_select(m, n, k, mode == 'exact', _sm_count(b.device)), 1), False
     started = time.time()
+    log = not _path_tuning.get()
+    label = f"INT8 GEMM {mode} {m}x{n}x{k}"
+    if log:
+        print(f"[WGPKernels] Autotuning {label}...", flush=True)
     timings = _best_of({config: (lambda config: lambda: gemm(a, a_lo, sa, b, sb, bias, y.dtype, config[1], config[0], y))(config)
                         for config in _CANDIDATES[mode]}, b.device)
     best_ms, best = min((ms, config) for config, ms in timings.items())
     _tuned[key] = list(best)
     _save_cache()
-    print(f"[INT8] Tuned INT8 GEMM {key.split('|')[0]} {key.split('|')[1]} in {time.time() - started:.2f} s: tiles {best[0]}, split {best[1]} ({best_ms * 1000:.1f} us).")
+    if log:
+        print(f"[WGPKernels] Selected {label}: tiles {best[0]}, split {best[1]} ({best_ms * 1000:.1f} us; tuned in {time.time() - started:.2f} s).", flush=True)
     return best, True
 
 
@@ -401,16 +408,21 @@ def choose_path(x, weight, scale, bias=None, group=0, precise=False, act=None, a
     if torch.cuda.is_current_stream_capturing() or torch.compiler.is_compiling():
         return _static_path(m, k, precise)
     candidates = _precise_paths(m, k) + ([] if precise else ['block'])
-    timings = _best_of({path: (lambda path: lambda: _run(path, x, weight, scale, bias, group, act, act_weight, eps))(path) for path in candidates},
-                       x.device)
+    label = f"INT8 path {m}x{n}x{k}{f' ConvRot {group}' if group else ''}{f' {act}' if act else ''}{' (precise)' if precise else ''}"
+    started = time.time()
+    print(f"[WGPKernels] Autotuning {label}...", flush=True)
+    token = _path_tuning.set(True)
+    try:
+        timings = _best_of({path: (lambda path: lambda: _run(path, x, weight, scale, bias, group, act, act_weight, eps))(path) for path in candidates},
+                           x.device)
+    finally:
+        _path_tuning.reset(token)
     full_ms, path = min((timings[p], p) for p in candidates if p != 'block')
     if not precise and full_ms > (1 + EXACT_TOLERANCE) * timings['block']:
         path = 'block'
     _tuned[key] = _paths[shape] = path
     _save_cache()
-    summary = ", ".join(f"{p} {timings[p] * 1000:.1f} us" for p in candidates)
-    print(f"[INT8] INT8 path for {_path_bucket(m)}x{n}x{k}{f' ConvRot {group}' if group else ''}{f' {act}' if act else ''}{' (precise)' if precise else ''}: "
-          f"{path} ({summary}).")
+    print(f"[WGPKernels] Selected {label}: {path} ({timings[path] * 1000:.1f} us; tuned in {time.time() - started:.2f} s).", flush=True)
     return path
 
 
