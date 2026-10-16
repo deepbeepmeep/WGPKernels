@@ -31,6 +31,8 @@ from pathlib import Path
 import torch
 
 SCRATCH_BYTES = 16 * 1024 * 1024
+# The block quantizer and group rotation put token rows on CUDA's grid Y axis.
+MAX_GRID_Y = 65535
 EXACT_TOLERANCE = 0.10
 # Fallback thresholds (RTX 5090) when a choice cannot be timed; candidate limits of the few-token paths.
 EXACT_ROWS, LINE_ROWS, SMALL_ROWS = 64, 2, 16
@@ -113,8 +115,13 @@ def quantize_blocks(x, group=0, act=None, act_weight=None, eps=0.0):
     q = torch.empty((m, k), dtype=torch.int8, device=x.device)
     scale = torch.empty((m, (k + 127) // 128), dtype=torch.float32, device=x.device)
     inv_rms = torch.empty(m, dtype=torch.float32, device=x.device) if act == "rms_norm" and k > 16384 else None
-    _check(_lib.wq8_quantize_blocks(x.data_ptr(), q.data_ptr(), scale.data_ptr(), m, k, x.stride(0), _DTYPES[x.dtype], group, ACTS[act],
-                                    _ptr(act_weight), eps, _ptr(inv_rms), _stream(x.device)))
+    x_ptr, q_ptr, scale_ptr, rms_ptr = x.data_ptr(), q.data_ptr(), scale.data_ptr(), _ptr(inv_rms)
+    ldx, itemsize, scale_columns = x.stride(0), x.element_size(), scale.shape[1]
+    stream = _stream(x.device)
+    for start in range(0, m, MAX_GRID_Y):
+        rows = min(MAX_GRID_Y, m - start)
+        _check(_lib.wq8_quantize_blocks(x_ptr + start * ldx * itemsize, q_ptr + start * k, scale_ptr + start * scale_columns * 4, rows, k, ldx,
+                                        _DTYPES[x.dtype], group, ACTS[act], _ptr(act_weight), eps, None if rms_ptr is None else rms_ptr + start * 4, stream))
     return q, scale
 
 
@@ -294,7 +301,11 @@ def gemv_lines(x, weight, scale, bias=None, residual=None, residual_scale=None, 
 def rotate_groups(x, group):
     """ConvRot rotation (groups of 16, 64 or 256), rounded once to the input dtype: the few-token paths keep activations unquantized."""
     out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
-    _check(_lib.wq8_rotate_groups(x.data_ptr(), out.data_ptr(), x.shape[0], x.shape[1], x.stride(0), _DTYPES[x.dtype], group, _stream(x.device)))
+    x_ptr, out_ptr, itemsize, ldx = x.data_ptr(), out.data_ptr(), x.element_size(), x.stride(0)
+    stream = _stream(x.device)
+    for start in range(0, x.shape[0], MAX_GRID_Y):
+        rows = min(MAX_GRID_Y, x.shape[0] - start)
+        _check(_lib.wq8_rotate_groups(x_ptr + start * ldx * itemsize, out_ptr + start * x.shape[1] * itemsize, rows, x.shape[1], ldx, _DTYPES[x.dtype], group, stream))
     return out
 
 
