@@ -5,14 +5,17 @@ AMD (HIP): python -m wgpkernels.build --hip <ROCm SDK root, holding bin/hipcc> [
 import argparse
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 
 PACKAGE = Path(__file__).resolve().parent
-# SASS for every listed architecture plus PTX for the newest, so later GPUs JIT once.
+# SASS for every listed architecture plus PTX for the newest, so later GPUs JIT once. Turing (sm_75) runs the INT8 kernels with synchronous copies and m8n8k16 MMAs;
+# the activation / convolution library needs SM80.
 DEFAULT_ARCHS = "all"
+MIN_ARCH = {"int8": 75, "ops": 80}
 DEFAULT_HIP_ARCHS = "gfx1200,gfx1201"  # RDNA4: the AMD targets need rocWMMA's gfx12 WMMA
 # library name -> CUDA source, relative to the package
 LIBRARIES = {"int8": "int8/int8_gemm.cu", "ops": "ops/ops.cu"}
@@ -29,7 +32,8 @@ def _msvc_environment():
     if shutil.which("cl"):
         return env
     program_files = Path(os.environ["ProgramFiles(x86)"])
-    install = Path(subprocess.check_output([str(program_files / "Microsoft Visual Studio/Installer/vswhere.exe"), "-latest", "-products", "*",
+    # the newest Visual Studio that nvcc accepts (2019 to 2022): a newer one beside it fails nvcc's host compiler check
+    install = Path(subprocess.check_output([str(program_files / "Microsoft Visual Studio/Installer/vswhere.exe"), "-latest", "-version", "[16.0,18.0)", "-products", "*",
                                             "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"], text=True).strip())
     version = lambda path: tuple(int(part) for part in path.name.split("."))
     vc = max((install / "VC/Tools/MSVC").iterdir(), key=version)
@@ -44,7 +48,7 @@ def _msvc_environment():
 def build(name="int8", archs=DEFAULT_ARCHS, output=None, nvcc="nvcc", verbose=False):
     if archs == "all":
         codes = subprocess.check_output([nvcc, "--list-gpu-code"], text=True)
-        archs = ",".join(code for code in re.findall(r"^sm_(\d+)$", codes, re.MULTILINE) if int(code) >= 80)
+        archs = ",".join(code for code in re.findall(r"^sm_(\d+)$", codes, re.MULTILINE) if int(code) >= MIN_ARCH[name])
     archs = sorted({int(a) for a in str(archs).split(",")})
     target = Path(output or library_file(name)).resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -72,6 +76,7 @@ def build_hip(name="int8", archs=DEFAULT_HIP_ARCHS, output=None, rocm=None, verb
     target.parent.mkdir(parents=True, exist_ok=True)
     flags = [f"--offload-arch={arch}" for arch in str(archs).split(",")]
     flags += [f"--rocm-path={rocm}", f"--rocm-device-lib-path={rocm / 'lib/llvm/amdgcn/bitcode'}"] + ([] if os.name == "nt" else ["-fPIC", "-fvisibility=hidden"])
+    flags += shlex.split(os.environ.get("WGPKERNELS_HIP_FLAGS", ""))  # e.g. an older glibc sysroot and its libstdc++ headers on Linux
     if verbose:
         flags += ["-Rpass-analysis=kernel-resource-usage"]
     env = _msvc_environment() if os.name == "nt" else os.environ.copy()
@@ -89,7 +94,7 @@ def build_hip(name="int8", archs=DEFAULT_HIP_ARCHS, output=None, rocm=None, verb
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--library", default="int8", choices=sorted(LIBRARIES))
-    parser.add_argument("--arch", default=None, help="all supported SM80+ targets (default), comma separated SM versions (CUDA), or gfx targets (HIP)")
+    parser.add_argument("--arch", default=None, help="all supported targets (default: SM75+ for int8, SM80+ for ops), comma separated SM versions (CUDA), or gfx targets (HIP)")
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--nvcc", default="nvcc")
     parser.add_argument("--hip", default=None, help="ROCm SDK root: build for AMD GPUs with its hipcc")

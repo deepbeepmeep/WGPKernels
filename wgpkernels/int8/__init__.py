@@ -40,6 +40,7 @@ EXACT_ROWS, LINE_ROWS, SMALL_ROWS = 64, 2, 16
 LINE_MAX_ROWS, SMALL_MAX_ROWS, DECIDE_MAX_ROWS = 4, 32, 4096
 ACTS = {None: 0, "rms_norm": 1, "swiglu": 2}
 _COUNTERS = 1024  # split tiles never exceed the SM count (GEMM) or twice of it (few-token kernel)
+HIP_ARCHS = ("gfx1200", "gfx1201")  # the AMD targets of the HIP library (RDNA4)
 _lib = None
 _DTYPES = {torch.float16: 0, torch.bfloat16: 1, torch.float32: 2}
 _sms = {}
@@ -72,7 +73,9 @@ def load_library(path=None):
     lib.wq8_gemv_lines.argtypes = [p, i64, p, p, p, p, p, p, i, i, i, i, p]
     lib.wq8_rotate_groups.argtypes = [p, p, i, i, i64, i, i, p]
     for index in range(torch.cuda.device_count()):
-        _counters.setdefault(index, torch.zeros(_COUNTERS, dtype=torch.int32, device=torch.device("cuda", index)))
+        # ROCm: only the GPUs the library is built for (PyTorch has no kernels for others, e.g. a Ryzen integrated GPU beside the RDNA4 one)
+        if torch.version.hip is None or torch.cuda.get_device_properties(index).gcnArchName.split(":")[0] in HIP_ARCHS:
+            _counters.setdefault(index, torch.zeros(_COUNTERS, dtype=torch.int32, device=torch.device("cuda", index)))
     _lib = lib
     return lib
 
@@ -149,7 +152,7 @@ def transform_rows(x, group=0, act=None, act_weight=None, eps=0.0):
 # Tile configurations (variant, stream-K split) timed per shape bucket and GPU; the first is the untuned default.
 _CANDIDATES = {'row': ((0, 1), (0, 0), (2, 0), (2, 1), (6, 0), (6, 1)), 'exact': ((1, 0), (1, 1), (7, 0), (7, 1)), 'block': ((10, 1), (10, 0), (11, 0), (11, 1))}
 _MODES = {0: 'row', 2: 'row', 6: 'row', 1: 'exact', 7: 'exact', 10: 'block', 11: 'block'}
-_TUNING_VERSION = 11
+_TUNING_VERSION = 12
 _TUNING_PATH = Path.home() / ".triton" / "autotune" / "wgpkernels_int8.json"
 _tuned = None
 _path_tuning = ContextVar("wgpkernels_int8_path_tuning", default=False)

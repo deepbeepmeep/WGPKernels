@@ -43,12 +43,14 @@ reach 7-13%.
 
 ## Requirements
 
-- NVIDIA GPU with compute capability 8.0 or newer (RTX 30XX, 40XX, 50XX, A100, H100, B200 and later), Windows or Linux x86_64.
+- NVIDIA GPU with compute capability 7.5 or newer for the INT8 kernels (RTX 20XX, GTX 16XX, T4, then RTX 30XX, 40XX, 50XX, A100, H100,
+  B200 and later), 8.0 or newer for the activation / convolution kernels, Windows or Linux x86_64.
 - PyTorch with CUDA, Python 3.10 or newer.
 - Driver: R570 or newer for the CUDA 12.8 builds (`+cu128`), R580 or newer for the CUDA 13 builds (`+cu130`).
 - Linux: glibc 2.34 or newer (Ubuntu 22.04, Debian 12, RHEL 9 or later).
 
-Source builds include every base SM80+ target supported by the selected CUDA toolkit, plus PTX for its newest target.
+Source builds include every base target supported by the selected CUDA toolkit (SM75+ for the INT8 library, SM80+ for the activation /
+convolution library), plus PTX for its newest target. On Turing (SM75) the INT8 kernels use synchronous copies and m8n8k16 MMAs.
 Validation was performed on an RTX 5090; on other GPUs, run `selftest()` (WanGP does it before selecting the INT8 kernels).
 
 **AMD (experimental)**: a HIP build for RDNA4 (`gfx1200`, `gfx1201`) on Windows and Linux with PyTorch 2.13.0 / ROCm 10.0. The INT8 GEMM
@@ -155,11 +157,12 @@ HIP build; the existing INT8 HIP library is unchanged.
 
 ### Toolchain
 
-Requirements: CUDA toolkit 12.8 or newer, and MSVC (Windows, found automatically through `vswhere`) or gcc (Linux).
+Requirements: CUDA toolkit 12.8 or newer, and MSVC (Windows, found automatically through `vswhere`: the newest Visual Studio 2019-2022,
+the versions nvcc accepts) or gcc (Linux).
 
 ```bash
-python -m wgpkernels.build                       # every toolkit-supported SM80+ target into wgpkernels/int8/
-python -m wgpkernels.build --library ops         # same targets for activation/convolution kernels
+python -m wgpkernels.build                       # every toolkit-supported SM75+ target into wgpkernels/int8/
+python -m wgpkernels.build --library ops         # SM80+ targets for activation/convolution kernels
 python -m wgpkernels.build --arch 120 --verbose  # one architecture, with register and spill report
 python -m wgpkernels.build --hip <ROCm SDK root> # AMD gfx1200 and gfx1201 with ROCm 10's hipcc
 pip install -e .                                 # editable install using the library built in place

@@ -44,12 +44,40 @@ DEVICE float shfl_xor(float v, int lane_mask) {
 // ---------------------------------------------------------------------------------------------------------------------
 DEVICE uint32_t smem_u32(const void* p) { return static_cast<uint32_t>(__cvta_generic_to_shared(p)); }
 
+// Turing (sm_75) has no asynchronous copies and no m16n8k32 INT8 MMA: copies are synchronous 16-byte loads and stores (the
+// pipeline's waits are no-ops, its barriers keep the order), and each m16n8k32 is four m8n8k16 on the same fragment registers
+// (exact INT32 sums: the results are the same).
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+#define WGP_SM75 1
+#else
+#define WGP_SM75 0
+#endif
+
 DEVICE void cp_async16(uint32_t dst, const void* src, bool valid) {
     // Zero fill out-of-range chunks: partial M/N/K tiles need no separate code path.
+#if WGP_SM75
+    const uint4 v = valid ? __ldcg(reinterpret_cast<const uint4*>(src)) : make_uint4(0, 0, 0, 0);
+    asm volatile("st.shared.v4.u32 [%0], {%1,%2,%3,%4};\n" :: "r"(dst), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w));
+#else
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(dst), "l"(src), "r"(valid ? 16 : 0));
+#endif
 }
+// 4-byte copy (per-row scales): .ca, the cp.async form that takes 4 bytes.
+DEVICE void cp_async4(uint32_t dst, const void* src, bool valid) {
+#if WGP_SM75
+    const uint32_t v = valid ? __ldca(reinterpret_cast<const unsigned int*>(src)) : 0u;
+    asm volatile("st.shared.u32 [%0], %1;\n" :: "r"(dst), "r"(v));
+#else
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n" :: "r"(dst), "l"(src), "r"(valid ? 4 : 0));
+#endif
+}
+#if WGP_SM75
+DEVICE void cp_async_commit() {}
+template<int N> DEVICE void cp_async_wait() {}
+#else
 DEVICE void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
-template<int N> DEVICE void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" :: "n"(N)); }
+template<int N> DEVICE void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" :: "n"(N > 0 ? N : 0)); }  // Turing's 2-stage tiles: never run here
+#endif
 
 DEVICE void ldmatrix_x4(uint32_t* r, uint32_t addr) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
@@ -57,9 +85,20 @@ DEVICE void ldmatrix_x4(uint32_t* r, uint32_t addr) {
 }
 
 DEVICE void mma_s8(int* c, const uint32_t* a, const uint32_t* b) {
+#if WGP_SM75
+    // a0/a1: rows g / g + 8 of k 0-15, a2/a3: of k 16-31; b0/b1: k 0-15 / 16-31 (the m16n8k32 fragments of these thread positions).
+    // Separate statements without volatile: the compiler interleaves the MMAs of independent accumulators.
+    #pragma unroll
+    for (int kh = 0; kh < 2; ++kh)
+        #pragma unroll
+        for (int h = 0; h < 2; ++h)
+            asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};\n"
+                : "+r"(c[2 * h]), "+r"(c[2 * h + 1]) : "r"(a[h + 2 * kh]), "r"(b[kh]));
+#else
     asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#endif
 }
 #endif
 
@@ -475,8 +514,11 @@ gemm_s8(const int8_t* __restrict__ a, const int8_t* __restrict__ a_lo, const flo
     // BLOCKS: sa holds one scale per row and 128-element K block. Each block's exact INT32 sums are scaled into FP32 accumulators.
     constexpr int KPB = 128 / BK;  // k-tiles per scale block
     float accf[BLOCKS ? MI : 1][BLOCKS ? NI : 1][4];
-    float block_scale[BLOCKS ? MI : 1][2];
+    // The scales of a block's BM rows come with the stage of its first k-tile (cp.async: no registers held while in flight) into a ring
+    // of three blocks; the slot of block b is refilled for block b + 3, whose stage is issued after every warp folded block b.
+    __shared__ float block_scales[BLOCKS ? 3 : 1][BLOCKS ? BM : 1];
     const int kblocks = (k + 127) / 128;
+    int work_m0 = 0, work_kb = 0;
 
     auto tile_origin = [&](int t, int& m0, int& n0) {
         // Grouped rasterization keeps a band of A rows and the B columns it meets resident in L2.
@@ -514,6 +556,8 @@ gemm_s8(const int8_t* __restrict__ a, const int8_t* __restrict__ a_lo, const flo
     const int8_t* a_src[C::A_PER]; const int8_t* b_src[C::B_PER];
     bool a_ok[C::A_PER], b_ok[C::B_PER];
     auto setup = [&](const Work& w) {
+        work_m0 = w.m0;
+        work_kb = w.kb;
         #pragma unroll
         for (int i = 0; i < C::A_PER; ++i) {
             const int r = w.m0 + row0 + i * C::ROW_STEP;
@@ -525,6 +569,13 @@ gemm_s8(const int8_t* __restrict__ a, const int8_t* __restrict__ a_lo, const flo
             const int r = w.n0 + row0 + i * C::ROW_STEP;
             b_ok[i] = r < n;
             b_src[i] = b + (b_ok[i] ? int64_t(r) * k + chunk * 16 : 0);
+        }
+    };
+    // BLOCKS: the activation scales of k-tile kt's block, with the tile that starts the block (or the work)
+    auto load_scales = [&](int kt) {
+        if (BLOCKS && (kt % KPB == 0 || kt == work_kb) && tid < BM) {
+            const int row = work_m0 + tid;
+            cp_async4(smem_u32(&block_scales[(kt / KPB) % 3][tid]), row < m ? sa + int64_t(row) * kblocks + kt / KPB : sa, row < m);
         }
     };
     auto load_stage = [&](int slot, int kt) {
@@ -543,28 +594,72 @@ gemm_s8(const int8_t* __restrict__ a, const int8_t* __restrict__ a_lo, const flo
             const bool ok = b_ok[i] && k_ok;
             cp_async16(sb_base + swizzle<C::CHUNKS>(row0 + i * C::ROW_STEP, chunk), ok ? b_src[i] + k0 : b, ok);
         }
+        load_scales(kt);
     };
+#if WGP_SM75
+    // Turing: the k-tile written at the end of tile kt (kt + STAGES - 1) is read from global memory into registers at the end of tile
+    // kt - 1, so that its load latency is hidden by a whole tile of MMAs (synchronous copies would stall every warp at once).
+    uint4 staged_a[C::A_PER][HILO ? 2 : 1], staged_b[C::B_PER];
+    auto fetch_stage = [&](int kt) {
+        const int k0 = kt * BK;
+        const bool k_ok = k0 + chunk * 16 < k;
+        #pragma unroll
+        for (int i = 0; i < C::A_PER; ++i) {
+            const bool ok = a_ok[i] && k_ok;
+            staged_a[i][0] = ok ? __ldcg(reinterpret_cast<const uint4*>(a_src[i] + k0)) : make_uint4(0, 0, 0, 0);
+            if (HILO) staged_a[i][HILO ? 1 : 0] = ok ? __ldcg(reinterpret_cast<const uint4*>(a_lo + (a_src[i] - a) + k0)) : make_uint4(0, 0, 0, 0);
+        }
+        #pragma unroll
+        for (int i = 0; i < C::B_PER; ++i)
+            staged_b[i] = b_ok[i] && k_ok ? __ldcg(reinterpret_cast<const uint4*>(b_src[i] + k0)) : make_uint4(0, 0, 0, 0);
+    };
+    auto store_stage = [&](int slot) {
+        const uint32_t sa_base = base + slot * C::STAGE_BYTES, sb_base = sa_base + C::A_BYTES * (HILO ? 2 : 1);
+        #pragma unroll
+        for (int i = 0; i < C::A_PER; ++i) {
+            const uint32_t dst = sa_base + swizzle<C::CHUNKS>(row0 + i * C::ROW_STEP, chunk);
+            #pragma unroll
+            for (int h = 0; h < (HILO ? 2 : 1); ++h)
+                asm volatile("st.shared.v4.u32 [%0], {%1,%2,%3,%4};\n" :: "r"(dst + h * C::A_BYTES), "r"(staged_a[i][h].x), "r"(staged_a[i][h].y),
+                             "r"(staged_a[i][h].z), "r"(staged_a[i][h].w));
+        }
+        #pragma unroll
+        for (int i = 0; i < C::B_PER; ++i)
+            asm volatile("st.shared.v4.u32 [%0], {%1,%2,%3,%4};\n" :: "r"(sb_base + swizzle<C::CHUNKS>(row0 + i * C::ROW_STEP, chunk)),
+                         "r"(staged_b[i].x), "r"(staged_b[i].y), "r"(staged_b[i].z), "r"(staged_b[i].w));
+    };
+#endif
     auto prologue = [&](const Work& w) {
         #pragma unroll
         for (int s = 0; s < STAGES - 1; ++s) {
             if (w.kb + s < w.ke) load_stage(s, w.kb + s);
             cp_async_commit();
         }
+#if WGP_SM75
+        if (w.kb + STAGES - 1 < w.ke) fetch_stage(w.kb + STAGES - 1);
+#endif
     };
 
     uint32_t af[2][C::ACC][MI][4], bf[2][NI][2];
+    // ldmatrix offsets: the swizzle's XOR term is the same for rows 16 apart, so the fragments of a k-step are one per-thread offset
+    // plus constants (16 rows = 16 * CHUNKS * 16 bytes).
+    uint32_t a_frag[C::KSTEPS], b_frag[C::KSTEPS];
+    #pragma unroll
+    for (int ks = 0; ks < C::KSTEPS; ++ks) {
+        a_frag[ks] = swizzle<C::CHUNKS>(warp_m * WM + (lane & 15), ks * 2 + (lane >> 4));
+        b_frag[ks] = swizzle<C::CHUNKS>(warp_n * WN + (lane & 7) + ((lane >> 4) << 3), ks * 2 + ((lane >> 3) & 1));
+    }
+    constexpr int ROWS16 = 16 * C::CHUNKS * 16;
     auto load_frags = [&](int buf, int slot, int ks) {
-        const uint32_t sa_base = base + slot * C::STAGE_BYTES, sb_base = sa_base + C::A_BYTES * (HILO ? 2 : 1);
+        const uint32_t sa_base = base + slot * C::STAGE_BYTES + a_frag[ks], sb_base = base + slot * C::STAGE_BYTES + C::A_BYTES * (HILO ? 2 : 1) + b_frag[ks];
         #pragma unroll
-        for (int mi = 0; mi < MI; ++mi) {
-            const int off = swizzle<C::CHUNKS>(warp_m * WM + mi * 16 + (lane & 15), ks * 2 + (lane >> 4));
+        for (int mi = 0; mi < MI; ++mi)
             #pragma unroll
-            for (int h = 0; h < C::ACC; ++h) ldmatrix_x4(af[buf][h][mi], sa_base + h * C::A_BYTES + off);
-        }
+            for (int h = 0; h < C::ACC; ++h) ldmatrix_x4(af[buf][h][mi], sa_base + h * C::A_BYTES + mi * ROWS16);
         #pragma unroll
         for (int ni = 0; ni < NI; ni += 2) {
             uint32_t t[4];
-            ldmatrix_x4(t, sb_base + swizzle<C::CHUNKS>(warp_n * WN + ni * 8 + (lane & 7) + ((lane >> 4) << 3), ks * 2 + ((lane >> 3) & 1)));
+            ldmatrix_x4(t, sb_base + (ni / 2) * ROWS16);
             bf[buf][ni][0] = t[0]; bf[buf][ni][1] = t[1]; bf[buf][ni + 1][0] = t[2]; bf[buf][ni + 1][1] = t[3];
         }
     };
@@ -591,48 +686,55 @@ gemm_s8(const int8_t* __restrict__ a, const int8_t* __restrict__ a_lo, const flo
         __syncthreads();
         load_frags(0, 0, 0);
         int slot = 0;
-        for (int kt = w.kb; kt < w.ke; ++kt) {
-            if (BLOCKS && (kt == w.kb || kt % KPB == 0)) {
-                // Issued a block ahead of their use: the block's MMAs hide the load latency.
+        for (int kt = w.kb; kt < w.ke;) {
+            // BLOCKS: the k-tiles of one scale block, then its fold, once and unpredicated (a fold inside the k-tile loop is issued,
+            // predicated off, on every k-tile).
+            const int block_end = BLOCKS ? min(w.ke, (kt / KPB + 1) * KPB) : w.ke;
+            for (; kt < block_end; ++kt) {
                 #pragma unroll
-                for (int mi = 0; mi < MI; ++mi)
-                    #pragma unroll
-                    for (int half = 0; half < 2; ++half) {
-                        const int row = w.m0 + warp_m * WM + mi * 16 + g + half * 8;
-                        block_scale[mi][half] = row < m ? __ldg(sa + int64_t(row) * kblocks + kt / KPB) : 0.f;
+                for (int ks = 0; ks < C::KSTEPS; ++ks) {
+                    const int buf = ks & 1;
+                    if (ks == C::KSTEPS - 1) {
+                        // Tile kt + 1 must have landed and every warp must be done with tile kt - 1, whose slot is refilled.
+                        cp_async_wait<STAGES - 3>();
+                        __syncthreads();
+                        const int next = kt + STAGES - 1;
+#if WGP_SM75
+                        if (next < w.ke) {
+                            store_stage((slot + STAGES - 1) % STAGES);
+                            load_scales(next);
+                            if (STAGES == 2) __syncthreads();  // with two stages the tile just stored is the next one read
+                            if (next + 1 < w.ke) fetch_stage(next + 1);
+                        }
+#else
+                        if (next < w.ke) load_stage((slot + STAGES - 1) % STAGES, next);
+#endif
+                        cp_async_commit();
+                        if (kt + 1 < w.ke) load_frags(buf ^ 1, (slot + 1) % STAGES, 0);
+                    } else {
+                        load_frags(buf ^ 1, slot, ks + 1);
                     }
-            }
-            #pragma unroll
-            for (int ks = 0; ks < C::KSTEPS; ++ks) {
-                const int buf = ks & 1;
-                if (ks == C::KSTEPS - 1) {
-                    // Tile kt + 1 must have landed and every warp must be done with tile kt - 1, whose slot is refilled.
-                    cp_async_wait<STAGES - 3>();
-                    __syncthreads();
-                    const int next = kt + STAGES - 1;
-                    if (next < w.ke) load_stage((slot + STAGES - 1) % STAGES, next);
-                    cp_async_commit();
-                    if (kt + 1 < w.ke) load_frags(buf ^ 1, (slot + 1) % STAGES, 0);
-                } else {
-                    load_frags(buf ^ 1, slot, ks + 1);
-                }
-                #pragma unroll
-                for (int mi = 0; mi < MI; ++mi)
                     #pragma unroll
-                    for (int ni = 0; ni < NI; ++ni)
+                    for (int mi = 0; mi < MI; ++mi)
                         #pragma unroll
-                        for (int h = 0; h < C::ACC; ++h) mma_s8(acc[h][mi][ni], af[buf][h][mi], bf[buf][ni]);
+                        for (int ni = 0; ni < NI; ++ni)
+                            #pragma unroll
+                            for (int h = 0; h < C::ACC; ++h) mma_s8(acc[h][mi][ni], af[buf][h][mi], bf[buf][ni]);
+                }
+                slot = (slot + 1) % STAGES;
             }
-            if (BLOCKS && ((kt + 1) % KPB == 0 || kt + 1 == w.ke)) {
+            if (BLOCKS) {
+                const float* scales = block_scales[((kt - 1) / KPB) % 3] + warp_m * WM + g;
                 #pragma unroll
-                for (int mi = 0; mi < MI; ++mi)
+                for (int mi = 0; mi < MI; ++mi) {
+                    const float s0 = scales[mi * 16], s1 = scales[mi * 16 + 8];
                     #pragma unroll
                     for (int ni = 0; ni < NI; ++ni) {
-                        fold_block_pair(&accf[mi][ni][0], &acc[0][mi][ni][0], block_scale[mi][0]);
-                        fold_block_pair(&accf[mi][ni][2], &acc[0][mi][ni][2], block_scale[mi][1]);
+                        fold_block_pair(&accf[mi][ni][0], &acc[0][mi][ni][0], s0);
+                        fold_block_pair(&accf[mi][ni][2], &acc[0][mi][ni][2], s1);
                     }
+                }
             }
-            slot = (slot + 1) % STAGES;
         }
         __syncthreads();  // every warp is done with shared memory before the next prologue refills it
     };
@@ -680,7 +782,9 @@ gemm_s8(const int8_t* __restrict__ a, const int8_t* __restrict__ a_lo, const flo
             }
             return v;
         };
-        if ((n & 7) == 0) {
+        // Turing's 2-stage 128x256 tile has no room for the staged output tile: its rows are stored directly.
+        constexpr bool STAGED_OUTPUT = BM * (BN + 8) * sizeof(T) <= C::SMEM;
+        if constexpr (STAGED_OUTPUT) if ((n & 7) == 0) {
             // Like CUTLASS's epilogue: stage the tile in shared memory (free after the mainloop; rows padded by 16 bytes so that
             // the 8 rows of a fragment hit distinct banks), then store whole rows with coalesced 16-byte accesses.
             constexpr int LD = BN + 8, VECS = BN / 8;
@@ -808,12 +912,22 @@ gemm_s8(const int8_t* __restrict__ a, const int8_t* __restrict__ a_lo, const flo
 // for weights and activations, which turns those bytes into valid MMA fragments without shared memory.
 // ---------------------------------------------------------------------------------------------------------------------
 template<class T> DEVICE void mma_16816(float* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
+#if WGP_SM75
+    // FP16 only (sm_75 has no BF16 MMA; BF16 few-token calls take the lines GEMV): two m16n8k8 on the k 0-7 / 8-15 fragments
+    if constexpr (std::is_same<T, __nv_bfloat16>::value)
+        __trap();
+    else
+        asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+                     "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%7,%8}, {%9}, {%0,%1,%2,%3};\n"
+                     : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(b0), "r"(a[2]), "r"(a[3]), "r"(b1));
+#else
     if constexpr (std::is_same<T, __nv_bfloat16>::value)
         asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
     else
         asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#endif
 }
 
 // Two signed INT8 bytes (selected by SEL from w) as an exact BF16/FP16 pair: (base | low7) - (base | sign bit), where
@@ -1200,6 +1314,44 @@ template<> struct Variant<6> { static constexpr int BM = 64, BN = 128, BK = 64, 
 template<> struct Variant<10> { static constexpr int BM = 128, BN = 128, BK = 64, WM = 64, WN = 32, STAGES = 4, CTAS = 1; static constexpr bool HILO = false, BLOCKS = true; };
 template<> struct Variant<11> { static constexpr int BM = 64, BN = 128, BK = 64, WM = 32, WN = 32, STAGES = 4, CTAS = 1; static constexpr bool HILO = false, BLOCKS = true; };
 template<> struct Variant<7> { static constexpr int BM = 64, BN = 128, BK = 64, WM = 32, WN = 32, STAGES = 4, CTAS = 1; static constexpr bool HILO = true, BLOCKS = false; };
+// Turing (sm_75, 64 KiB of shared memory per CTA): register-staged copies (a k-tile is read into registers a tile ahead and stored at
+// the end of the next one). The 128x128 and 64x128 tiles have 3 stages, the 128x256 tile 2 (48 KiB; a second barrier per k-tile); the
+// 128x128 HILO tile (72 KiB with 3 stages) is replaced by the 64x128 one.
+template<int V, int STAGES_> struct Stages : Variant<V> { static constexpr int STAGES = STAGES_; };
+template<> struct Variant<100> : Stages<0, 2> {};
+template<> struct Variant<102> : Stages<2, 3> {};
+template<> struct Variant<106> : Stages<6, 3> {};
+template<> struct Variant<107> : Stages<7, 3> {};
+template<> struct Variant<110> : Stages<10, 3> {};
+template<> struct Variant<111> : Stages<11, 3> {};
+
+// Compute capability below 8.0 of the current device (cached per device).
+static bool sm75_device() {
+    static int known[64] = {};
+    int device = 0;
+    cudaGetDevice(&device);
+    if (device < 0 || device >= 64) return false;
+    if (!known[device]) {
+        int major = 8;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+        known[device] = major < 8 ? 1 : 2;
+    }
+    return known[device] == 1;
+}
+
+// The variant a configuration runs as on the current device: on Turing, its 3-stage counterpart.
+static int device_variant(int variant) {
+    if (!sm75_device()) return variant;
+    switch (variant) {
+        case 0: return 100;
+        case 2: return 102;
+        case 6: return 106;
+        case 1: case 7: return 107;
+        case 10: return 110;
+        case 11: return 111;
+    }
+    return variant;
+}
 
 // split: 0 = whole tiles only, 1 = stream-K for an incomplete last wave.
 template<class V> Schedule make_schedule(int m, int n, int k, int sms, int split) {
@@ -1230,7 +1382,13 @@ template<int VI> void workspace_sizes(int m, int n, int k, int sms, int split, i
 }
 
 API void wq8_gemm_workspace(int m, int n, int k, int variant, int sms, int split, int64_t* sizes) {
-    switch (variant) {
+    switch (device_variant(variant)) {
+        case 100: return workspace_sizes<100>(m, n, k, sms, split, sizes);
+        case 102: return workspace_sizes<102>(m, n, k, sms, split, sizes);
+        case 106: return workspace_sizes<106>(m, n, k, sms, split, sizes);
+        case 107: return workspace_sizes<107>(m, n, k, sms, split, sizes);
+        case 110: return workspace_sizes<110>(m, n, k, sms, split, sizes);
+        case 111: return workspace_sizes<111>(m, n, k, sms, split, sizes);
         case 1: return workspace_sizes<1>(m, n, k, sms, split, sizes);
         case 2: return workspace_sizes<2>(m, n, k, sms, split, sizes);
         case 6: return workspace_sizes<6>(m, n, k, sms, split, sizes);
@@ -1283,7 +1441,13 @@ API int wq8_gemm_select(int m, int n, int k, int hilo, int sms) {
 template<class T> int dispatch_gemm(const int8_t* a, const int8_t* a_lo, const float* sa, const int8_t* b, const float* sb, const void* bias,
                                     const void* residual, const void* rscale, void* y, int m, int n, int k, int variant, int sms, int split,
                                     int* workspace, int* counters, cudaStream_t stream) {
-    switch (variant) {
+    switch (device_variant(variant)) {
+        case 100: return launch_gemm<T, 100>(a, a_lo, sa, b, sb, bias, residual, rscale, y, m, n, k, sms, split, workspace, counters, stream);
+        case 102: return launch_gemm<T, 102>(a, a_lo, sa, b, sb, bias, residual, rscale, y, m, n, k, sms, split, workspace, counters, stream);
+        case 106: return launch_gemm<T, 106>(a, a_lo, sa, b, sb, bias, residual, rscale, y, m, n, k, sms, split, workspace, counters, stream);
+        case 107: return launch_gemm<T, 107>(a, a_lo, sa, b, sb, bias, residual, rscale, y, m, n, k, sms, split, workspace, counters, stream);
+        case 110: return launch_gemm<T, 110>(a, a_lo, sa, b, sb, bias, residual, rscale, y, m, n, k, sms, split, workspace, counters, stream);
+        case 111: return launch_gemm<T, 111>(a, a_lo, sa, b, sb, bias, residual, rscale, y, m, n, k, sms, split, workspace, counters, stream);
         case 1: return launch_gemm<T, 1>(a, a_lo, sa, b, sb, bias, residual, rscale, y, m, n, k, sms, split, workspace, counters, stream);
         case 2: return launch_gemm<T, 2>(a, a_lo, sa, b, sb, bias, residual, rscale, y, m, n, k, sms, split, workspace, counters, stream);
         case 6: return launch_gemm<T, 6>(a, a_lo, sa, b, sb, bias, residual, rscale, y, m, n, k, sms, split, workspace, counters, stream);
@@ -1357,8 +1521,24 @@ template<class T, int MT, int V> int launch_small(const void* x, int64_t ldx, co
     return int(cudaGetLastError());
 }
 
+template<class T> int dispatch_lines(const void* x, int64_t ldx, const int8_t* w, const float* sw, const void* bias, const void* residual,
+                                     const void* rscale, void* y, int m, int n, int k, cudaStream_t stream);
+
 template<class T> int dispatch_small(const void* x, int64_t ldx, const int8_t* w, const float* sw, const void* bias, const void* residual, const void* rscale,
                                      void* y, int m, int n, int k, int sms, float* slots, int* counters, cudaStream_t stream) {
+    if (std::is_same<T, __nv_bfloat16>::value && sm75_device()) {
+        // Turing has no BF16 MMA: GEMVs (unquantized activations, exact INT8 weights, FP32 accumulation) of up to 7 tokens in one pass,
+        // of four tokens beyond (measured on an RTX 2080 Ti: 5 rows in one pass 0.40 ms vs 0.65 ms in two, 8 rows 0.88 vs 0.69 ms)
+        const int group = m <= 7 ? m : 4;
+        for (int r = 0; r < m; r += group) {
+            const int rows = m - r < group ? m - r : group;
+            const int code = dispatch_lines<T>(static_cast<const T*>(x) + int64_t(r) * ldx, ldx, w, sw, bias,
+                                               residual ? static_cast<const T*>(residual) + int64_t(r) * n : nullptr, rscale,
+                                               static_cast<T*>(y) + int64_t(r) * n, rows, n, k, stream);
+            if (code) return code;
+        }
+        return 0;
+    }
     if (m <= 8 && small_vectors(m, k) == 2) return launch_small<T, 1, 2>(x, ldx, w, sw, bias, residual, rscale, y, m, n, k, sms, slots, counters, stream);
     if (m <= 8) return launch_small<T, 1, 1>(x, ldx, w, sw, bias, residual, rscale, y, m, n, k, sms, slots, counters, stream);
     if (m <= 16) return launch_small<T, 2, 1>(x, ldx, w, sw, bias, residual, rscale, y, m, n, k, sms, slots, counters, stream);
@@ -1476,7 +1656,11 @@ template<class T> int dispatch_lines(const void* x, int64_t ldx, const int8_t* w
     if (m == 1) gemv_lines<T, 1><<<grid, 128, 0, stream>>>(src, ldx, w, sw, b, r, rs, dst, m, n, k);
     else if (m == 2) gemv_lines<T, 2><<<grid, 128, 0, stream>>>(src, ldx, w, sw, b, r, rs, dst, m, n, k);
     else if (m == 3) gemv_lines<T, 3><<<grid, 128, 0, stream>>>(src, ldx, w, sw, b, r, rs, dst, m, n, k);
-    else gemv_lines<T, 4><<<grid, 128, 0, stream>>>(src, ldx, w, sw, b, r, rs, dst, m, n, k);
+    else if (m == 4) gemv_lines<T, 4><<<grid, 128, 0, stream>>>(src, ldx, w, sw, b, r, rs, dst, m, n, k);
+    // 5 to 7 rows: Turing's BF16 few-token path (one read of the weights; from 8 rows two 4-row passes are faster)
+    else if (m == 5) gemv_lines<T, 5><<<grid, 128, 0, stream>>>(src, ldx, w, sw, b, r, rs, dst, m, n, k);
+    else if (m == 6) gemv_lines<T, 6><<<grid, 128, 0, stream>>>(src, ldx, w, sw, b, r, rs, dst, m, n, k);
+    else gemv_lines<T, 7><<<grid, 128, 0, stream>>>(src, ldx, w, sw, b, r, rs, dst, m, n, k);
     return int(cudaGetLastError());
 }
 

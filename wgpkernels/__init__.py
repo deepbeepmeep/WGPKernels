@@ -6,4 +6,4 @@ Kernel families:
 - wgpkernels.int8: INT8 weight linears (Quanto INT8 and ConvRot checkpoints).
 - wgpkernels.ops: AdaLN, PixelNorm + SiLU, FP32-accumulating valid Conv3D (CUDA).
 """
-__version__ = "1.1.2"
+__version__ = "1.2.0"
