@@ -43,8 +43,8 @@ reach 7-13%.
 
 ## Requirements
 
-- NVIDIA GPU with compute capability 7.5 or newer for the INT8 kernels (RTX 20XX, GTX 16XX, T4, then RTX 30XX, 40XX, 50XX, A100, H100,
-  B200 and later), 8.0 or newer for the activation / convolution kernels, Windows or Linux x86_64.
+- NVIDIA GPU with compute capability 7.5 or newer for the INT8 kernels (RTX 20XX, Quadro RTX, T4, then RTX 30XX, 40XX, 50XX, A100, H100,
+  B200 and later; GTX 16XX, without tensor cores, is untested), 8.0 or newer for the activation / convolution kernels, Windows or Linux x86_64.
 - PyTorch with CUDA, Python 3.10 or newer.
 - Driver: R570 or newer for the CUDA 12.8 builds (`+cu128`), R580 or newer for the CUDA 13 builds (`+cu130`).
 - Linux: glibc 2.34 or newer (Ubuntu 22.04, Debian 12, RHEL 9 or later).
