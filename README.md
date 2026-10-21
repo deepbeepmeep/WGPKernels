@@ -32,7 +32,7 @@ widths remain distinct, and path choices also distinguish ConvRot groups, fused 
 inputs above 4096 tokens use `block` directly. The first input in a bucket supplies the measurements reused for that bucket.
 
 Fusions, available on every path and computed in FP32 with a single final rounding:
-- input operation applied while the activation is quantized: `act="rms_norm"` (optional weight) or `act="swiglu"` (rows `[gate | value]`);
+- input operation applied while the activation is quantized: `act="rms_norm"` (optional weight), `act="swiglu"` (rows `[gate | value]`) or `act="gelu"` (tanh approximation);
 - residual epilogue: `Y = residual + residual_scale * (X @ W.T + bias)`, optionally written in place of the residual;
 - `prepare()` quantizes an activation once for several weights or row ranges (`linear_prepared()`).
 

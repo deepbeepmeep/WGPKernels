@@ -17,7 +17,8 @@ precise=True keeps the fastest full-precision path at every token count (layers 
 Activations are quantized in row chunks bounded by SCRATCH_BYTES, so no full-size quantized copy is allocated.
 
 Fusions (every path): an input operation applied in FP32 where the activation is quantized or rotated, never stored ('rms_norm': RMSNorm
-with an optional weight; 'swiglu': silu(gate) * value of rows [gate | value]), and a residual epilogue Y = R + scale * (X @ W.T + bias)
+with an optional weight; 'swiglu': silu(gate) * value of rows [gate | value]; 'gelu': GELU, tanh approximation), and a residual epilogue
+Y = R + scale * (X @ W.T + bias)
 computed in FP32 and rounded once, written in place of R when out is R. prepare() quantizes an activation once for several weights or
 row ranges of a weight (linear_prepared()).
 """
@@ -38,7 +39,7 @@ EXACT_TOLERANCE = 0.10
 # Fallback thresholds (RTX 5090) when a choice cannot be timed; candidate limits of the few-token paths.
 EXACT_ROWS, LINE_ROWS, SMALL_ROWS = 64, 2, 16
 LINE_MAX_ROWS, SMALL_MAX_ROWS, DECIDE_MAX_ROWS = 4, 32, 4096
-ACTS = {None: 0, "rms_norm": 1, "swiglu": 2}
+ACTS = {None: 0, "rms_norm": 1, "swiglu": 2, "gelu": 3}
 _COUNTERS = 1024  # split tiles never exceed the SM count (GEMM) or twice of it (few-token kernel)
 HIP_ARCHS = ("gfx1200", "gfx1201")  # the AMD targets of the HIP library (RDNA4)
 _lib = None
@@ -55,7 +56,7 @@ def default_library_path():
 def load_library(path=None):
     global _lib
     lib = ctypes.CDLL(str(Path(path or default_library_path()).resolve()))
-    if lib.wq8_abi() != 10:
+    if lib.wq8_abi() != 11:
         raise RuntimeError("INT8 GEMM library ABI mismatch; rebuild it")
     p, i, i64, f = ctypes.c_void_p, ctypes.c_int, ctypes.c_int64, ctypes.c_float
     lib.wq8_quantize.argtypes = [p, p, p, p, i, i, i64, i, i, i, p, f, p]
@@ -433,7 +434,8 @@ def linear(x, weight, scale, bias=None, group=0, precise=False, mode=None, act=N
            out=None):
     """Y = op(X) @ (INT8 weight * FP32 channel scales).T + bias for 2-D BF16/FP16 X (rows 16-byte aligned, unit column stride), or
     residual + residual_scale * (...) (contiguous, X's dtype; out may be the residual). act: None, 'rms_norm' (act_weight: K values in X's
-    dtype or None; eps) or 'swiglu' (X rows: gate | value). mode forces a path ('lines', 'small', 'exact', 'block', 'row'); by default
+    dtype or None; eps), 'swiglu' (X rows: gate | value) or 'gelu' (tanh approximation). mode forces a path ('lines', 'small', 'exact',
+    'block', 'row'); by default
     the path is chosen as described above."""
     path = mode or choose_path(x, weight, scale, bias, group, precise, act, act_weight, eps)
     return _run(path, x, weight, scale, bias, group, act, act_weight, eps, residual, residual_scale, out)
@@ -447,6 +449,8 @@ def _reference(x, w, s, bias, group, act, act_weight, eps, residual, residual_sc
         v = torch.nn.functional.silu(gate) * value
     elif act == "rms_norm":
         v = v * torch.rsqrt(v.pow(2).mean(-1, keepdim=True) + eps) * (1 if act_weight is None else act_weight.float())
+    elif act == "gelu":
+        v = torch.nn.functional.gelu(v, approximate="tanh")
     if group:
         v = _reference_rotation(v, group)
     if round_input:
@@ -462,7 +466,8 @@ def selftest(device=None):
     variants = {"exact": 7, "block": 11, "row": 6}
     cases = ((1, "lines", 0, None, False), (5, "small", 0, None, False), (5, "small", 64, None, False), (40, "exact", 0, None, False),
              (40, "block", 256, None, False), (40, "row", 16, None, False), (2, "lines", 0, "swiglu", True), (5, "small", 64, "rms_norm", True),
-             (40, "exact", 256, "rms_norm", False), (40, "block", 0, "swiglu", True), (40, "block", 16, "rms_norm", True), (40, "exact", 64, None, True))
+             (40, "exact", 256, "rms_norm", False), (40, "block", 0, "swiglu", True), (40, "block", 16, "rms_norm", True), (40, "exact", 64, None, True),
+             (3, "lines", 64, "gelu", False), (5, "small", 0, "gelu", True), (40, "exact", 16, "gelu", False), (40, "block", 256, "gelu", True))
     for dtype in (torch.bfloat16, torch.float16):
         w = torch.randint(-127, 128, (96, 256), dtype=torch.int8, device=device, generator=generator)
         s = torch.rand(96, device=device, generator=generator) / 127

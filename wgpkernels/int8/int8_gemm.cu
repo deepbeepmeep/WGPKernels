@@ -190,8 +190,14 @@ DEVICE uint32_t pack_s8x4(int a, int b, int c, int d) {
 
 // Input operations applied in FP32 where the activation is quantized (or rotated for the few-token paths), so that the transformed
 // activation is never rounded or stored: ACT_RMS = RMSNorm x / sqrt(mean(x^2) + eps) * weight over the K inputs of a row;
-// ACT_SWIGLU = silu(gate) * value of a row holding [gate (K) | value (K)].
-enum { ACT_NONE = 0, ACT_RMS = 1, ACT_SWIGLU = 2 };
+// ACT_SWIGLU = silu(gate) * value of a row holding [gate (K) | value (K)]; ACT_GELU = GELU of each input, tanh approximation
+// (PyTorch's gelu(approximate='tanh') arithmetic in FP32).
+enum { ACT_NONE = 0, ACT_RMS = 1, ACT_SWIGLU = 2, ACT_GELU = 3 };
+
+DEVICE float gelu_tanh(float x) {
+    const float inner = 0.7978845608028654f * (x + 0.044715f * (x * x * x));  // sqrt(2 / pi) * (x + 0.044715 x^3)
+    return 0.5f * x * (1.f + tanhf(inner));
+}
 
 template<class T, int ACT> DEVICE void load_act(const T* row, int k, int col, float* v, bool valid) {
     load8(row + col, v, valid);
@@ -200,6 +206,10 @@ template<class T, int ACT> DEVICE void load_act(const T* row, int k, int col, fl
         load8(row + k + col, u, valid);
         #pragma unroll
         for (int j = 0; j < 8; ++j) v[j] = v[j] / (1.f + expf(-v[j])) * u[j];
+    }
+    if (ACT == ACT_GELU) {
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) v[j] = gelu_tanh(v[j]);
     }
 }
 
@@ -1252,7 +1262,7 @@ int launch_gemm_wmma(const int8_t* a, const int8_t* a_lo, const float* sa, const
 #define API extern "C" __attribute__((visibility("default")))
 #endif
 
-API int wq8_abi() { return 10; }
+API int wq8_abi() { return 11; }
 
 template<class T, int GROUP, bool HILO, int ACT>
 int launch_quantize(const void* x, int8_t* hi, int8_t* lo, float* scale, int m, int k, int64_t ldx, const void* act_weight, float eps, cudaStream_t stream) {
@@ -1284,12 +1294,14 @@ int dispatch_quantize_act(const void* x, int8_t* hi, int8_t* lo, float* scale, i
         case ACT_NONE: return dispatch_quantize<T, HILO, ACT_NONE>(x, hi, lo, scale, m, k, ldx, group, aw, eps, stream);
         case ACT_RMS: return dispatch_quantize<T, HILO, ACT_RMS>(x, hi, lo, scale, m, k, ldx, group, aw, eps, stream);
         case ACT_SWIGLU: return dispatch_quantize<T, HILO, ACT_SWIGLU>(x, hi, lo, scale, m, k, ldx, group, aw, eps, stream);
+        case ACT_GELU: return dispatch_quantize<T, HILO, ACT_GELU>(x, hi, lo, scale, m, k, ldx, group, aw, eps, stream);
     }
     return -1;
 }
 
 // Row INT8 of op(x): dtype 0 = FP16, 1 = BF16, 2 = FP32 (no input operation). K must be a multiple of 8 and of the group; rows are
-// 16-byte aligned. act: 0 none, 1 RMSNorm (act_weight: K values of x's dtype or null), 2 SwiGLU (x rows hold 2K values: gate | value).
+// 16-byte aligned. act: 0 none, 1 RMSNorm (act_weight: K values of x's dtype or null), 2 SwiGLU (x rows hold 2K values: gate | value),
+// 3 GELU (tanh approximation).
 API int wq8_quantize(const void* x, int8_t* hi, int8_t* lo, float* scale, int m, int k, int64_t ldx, int dtype, int group, int act,
                      const void* act_weight, float eps, cudaStream_t stream) {
     if (!m) return 0;
@@ -1731,6 +1743,7 @@ int dispatch_quantize_blocks_act(const void* x, int8_t* q, float* scale, int m, 
         case ACT_NONE: return dispatch_quantize_blocks<T, ACT_NONE>(x, q, scale, m, k, ldx, group, aw, eps, inv_rms, stream);
         case ACT_RMS: return dispatch_quantize_blocks<T, ACT_RMS>(x, q, scale, m, k, ldx, group, aw, eps, inv_rms, stream);
         case ACT_SWIGLU: return dispatch_quantize_blocks<T, ACT_SWIGLU>(x, q, scale, m, k, ldx, group, aw, eps, inv_rms, stream);
+        case ACT_GELU: return dispatch_quantize_blocks<T, ACT_GELU>(x, q, scale, m, k, ldx, group, aw, eps, inv_rms, stream);
     }
     return -1;
 }
@@ -1755,6 +1768,7 @@ int launch_transform(const void* x, void* out, int m, int k, int64_t ldx, int ac
         case ACT_NONE: transform_rows<T, GROUP, ACT_NONE><<<m, 256, 0, stream>>>(src, dst, k, ldx, w, eps); break;
         case ACT_RMS: transform_rows<T, GROUP, ACT_RMS><<<m, 256, 0, stream>>>(src, dst, k, ldx, w, eps); break;
         case ACT_SWIGLU: transform_rows<T, GROUP, ACT_SWIGLU><<<m, 256, 0, stream>>>(src, dst, k, ldx, w, eps); break;
+        case ACT_GELU: transform_rows<T, GROUP, ACT_GELU><<<m, 256, 0, stream>>>(src, dst, k, ldx, w, eps); break;
         default: return -1;
     }
     return int(cudaGetLastError());
