@@ -16,6 +16,9 @@ first call and cached (fixed thresholds measured on an RTX 5090 apply during CUD
 precise=True keeps the fastest full-precision path at every token count (layers whose activations need it).
 Activations are quantized in row chunks bounded by SCRATCH_BYTES, so no full-size quantized copy is allocated.
 
+Group-quantized weights (one FP32 scale per output channel and 128-element block of K, scale (N, ceil(K / 128))) run the 'block' and
+'exact' paths: each block's exact INT32 sums are promoted with their weight scales into FP32 accumulators.
+
 Fusions (every path): an input operation applied in FP32 where the activation is quantized or rotated, never stored ('rms_norm': RMSNorm
 with an optional weight; 'swiglu': silu(gate) * value of rows [gate | value]; 'gelu': GELU, tanh approximation), and a residual epilogue
 Y = R + scale * (X @ W.T + bias)
@@ -43,6 +46,7 @@ ACTS = {None: 0, "rms_norm": 1, "swiglu": 2, "gelu": 3}
 _COUNTERS = 1024  # split tiles never exceed the SM count (GEMM) or twice of it (few-token kernel)
 HIP_ARCHS = ("gfx1200", "gfx1201")  # the AMD targets of the HIP library (RDNA4)
 _lib = None
+_weight_groups = False  # the library takes per-(n, k-block) weight scales (wq8_features bit 0)
 _DTYPES = {torch.float16: 0, torch.bfloat16: 1, torch.float32: 2}
 _sms = {}
 _counters = {}
@@ -53,11 +57,18 @@ def default_library_path():
     return Path(__file__).with_name("wgp_int8.dll" if os.name == "nt" else "libwgp_int8.so")
 
 
+def weight_groups_supported():
+    """Whether the loaded library takes per-(n, 128-element k-block) weight scales (N, ceil(K / 128))."""
+    return _weight_groups
+
+
 def load_library(path=None):
-    global _lib
+    global _lib, _weight_groups
     lib = ctypes.CDLL(str(Path(path or default_library_path()).resolve()))
     if lib.wq8_abi() != 11:
         raise RuntimeError("INT8 GEMM library ABI mismatch; rebuild it")
+    features = getattr(lib, "wq8_features", None)
+    _weight_groups = bool(features and features() & 1)
     p, i, i64, f = ctypes.c_void_p, ctypes.c_int, ctypes.c_int64, ctypes.c_float
     lib.wq8_quantize.argtypes = [p, p, p, p, i, i, i64, i, i, i, p, f, p]
     lib.wq8_quantize_blocks.argtypes = [p, p, p, i, i, i64, i, i, i, p, f, p, p]
@@ -151,8 +162,10 @@ def transform_rows(x, group=0, act=None, act_weight=None, eps=0.0):
 
 
 # Tile configurations (variant, stream-K split) timed per shape bucket and GPU; the first is the untuned default.
-_CANDIDATES = {'row': ((0, 1), (0, 0), (2, 0), (2, 1), (6, 0), (6, 1)), 'exact': ((1, 0), (1, 1), (7, 0), (7, 1)), 'block': ((10, 1), (10, 0), (11, 0), (11, 1))}
-_MODES = {0: 'row', 2: 'row', 6: 'row', 1: 'exact', 7: 'exact', 10: 'block', 11: 'block'}
+_CANDIDATES = {'row': ((0, 1), (0, 0), (2, 0), (2, 1), (6, 0), (6, 1)), 'exact': ((1, 0), (1, 1), (7, 0), (7, 1)), 'block': ((10, 1), (10, 0), (11, 0), (11, 1)),
+               # per-(n, k-block) weight scales
+               'exact+g': ((14, 1), (14, 0)), 'block+g': ((12, 1), (12, 0), (13, 0), (13, 1))}
+_MODES = {0: 'row', 2: 'row', 6: 'row', 1: 'exact', 7: 'exact', 10: 'block', 11: 'block', 12: 'block+g', 13: 'block+g', 14: 'exact+g'}
 _TUNING_VERSION = 12
 _TUNING_PATH = Path.home() / ".triton" / "autotune" / "wgpkernels_int8.json"
 _tuned = None
@@ -227,7 +240,7 @@ def _tuned_config(a, a_lo, sa, b, sb, bias, y, mode):
     if config is not None:
         return tuple(config), True
     if torch.cuda.is_current_stream_capturing() or torch.compiler.is_compiling():
-        if mode == 'block':
+        if mode in ('block', 'block+g', 'exact+g'):
             return _CANDIDATES[mode][0], False
         return (_lib.wq8_gemm_select(m, n, k, mode == 'exact', _sm_count(b.device)), 1), False
     started = time.time()
@@ -265,8 +278,18 @@ def _plan(a, a_lo, sa, b, sb, bias, y, mode, scratch_output):
     return plan
 
 
+def _weight_scale_groups(sb):
+    """Whether sb holds one scale per output channel and 128-element block of K (N, ceil(K / 128)), rather than per channel (N)."""
+    if sb.dim() != 2:
+        return False
+    if not _weight_groups:
+        raise RuntimeError("This INT8 library predates per-(n, k-block) weight scales; rebuild it")
+    return True
+
+
 def gemm(a, a_lo, sa, b, sb, bias, out_dtype, split=None, variant=None, out=None, mode=None, residual=None, residual_scale=None):
-    """mode: 'row' (sa per row), 'exact' (a_lo residual) or 'block' (sa per row and 128-element block); inferred when omitted.
+    """mode: 'row' (sa per row), 'exact' (a_lo residual) or 'block' (sa per row and 128-element block); inferred when omitted. sb: per
+    output channel (N), or per channel and 128-element block of K (N, ceil(K / 128)) with the 'exact' and 'block' modes (variants 12-14).
     residual (M, N) and residual_scale (N) in out_dtype: Y = residual + residual_scale * (A @ B.T + bias); out may be the residual."""
     m, k = a.shape
     n = b.shape[0]
@@ -274,6 +297,10 @@ def gemm(a, a_lo, sa, b, sb, bias, out_dtype, split=None, variant=None, out=None
     y = torch.empty((m, n), dtype=out_dtype, device=a.device) if out is None else out
     if variant is None and split is None:
         mode = mode or ('exact' if a_lo is not None else 'block' if sa.dim() == 2 else 'row')
+        if _weight_scale_groups(sb):
+            if mode == 'row':
+                raise ValueError("Weights with per-(n, k-block) scales run the 'block' or 'exact' path")
+            mode += '+g'
         variant, split, slot_bytes, counter_bytes = _plan(a, a_lo, sa, b, sb, bias, y, mode, residual is not None)
     else:
         split = 1 if split is None else split
@@ -347,6 +374,8 @@ def prepare(x, group=0, path="block", act=None, act_weight=None, eps=0.0):
 
 def linear_prepared(prepared, weight, scale, bias=None, residual=None, residual_scale=None, out=None):
     """Y = prepared @ (weight * scale).T + bias (or residual + residual_scale * (...)), weight an INT8 (N, K) matrix or row range."""
+    if prepared.path in ("lines", "small") and scale.dim() == 2:
+        raise ValueError("Weights with per-(n, k-block) scales run the 'block' or 'exact' path")
     if prepared.path == "lines":
         return gemv_lines(prepared.x, weight, scale, bias, residual, residual_scale, out)
     if prepared.path == "small":
@@ -375,14 +404,16 @@ def _run(path, x, weight, scale, bias, group, act=None, act_weight=None, eps=0.0
     return _gemm_path(x, weight, scale, bias, group, path, act, act_weight, eps, residual, residual_scale, out)
 
 
-def _precise_paths(m, k):
-    return [path for path, ok in (('lines', m <= LINE_MAX_ROWS and k % 4 == 0), ('small', m <= SMALL_MAX_ROWS and k % 64 == 0), ('exact', True)) if ok]
+def _precise_paths(m, k, groups=False):
+    """Full-precision candidates; weights with per-(n, k-block) scales have only 'exact' (the few-token paths take channel scales)."""
+    return [path for path, ok in (('lines', m <= LINE_MAX_ROWS and k % 4 == 0 and not groups), ('small', m <= SMALL_MAX_ROWS and k % 64 == 0 and not groups),
+                                  ('exact', True)) if ok]
 
 
-def _static_path(m, k, precise):
-    if m <= LINE_ROWS and k % 4 == 0:
+def _static_path(m, k, precise, groups=False):
+    if m <= LINE_ROWS and k % 4 == 0 and not groups:
         return 'lines'
-    if m <= SMALL_ROWS and k % 64 == 0:
+    if m <= SMALL_ROWS and k % 64 == 0 and not groups:
         return 'small'
     return 'exact' if precise or m <= EXACT_ROWS else 'block'
 
@@ -400,18 +431,20 @@ def choose_path(x, weight, scale, bias=None, group=0, precise=False, act=None, a
     (m, k), n = (x.shape[0], weight.shape[1]), weight.shape[0]
     if m > DECIDE_MAX_ROWS and not precise:
         return 'block'  # two INT8 passes never come close to one at this size
-    shape = (m, n, k, group, act, precise, x.device.index)
+    groups = _weight_scale_groups(scale)
+    shape = (m, n, k, group, act, precise, x.device.index, groups)
     path = _paths.get(shape)
     if path is not None:
         return path
-    key = f"path{'+precise' if precise else ''}|{_path_bucket(m)}x{n}x{k}|g{group}{f'|{act}' if act else ''}|{_device_name(x.device.index)}"
+    key = (f"path{'+precise' if precise else ''}|{_path_bucket(m)}x{n}x{k}|g{group}{f'|{act}' if act else ''}{'|wgroups' if groups else ''}"
+           f"|{_device_name(x.device.index)}")
     path = _cache().get(key)
     if path is not None:
         _paths[shape] = path
         return path
     if torch.cuda.is_current_stream_capturing() or torch.compiler.is_compiling():
-        return _static_path(m, k, precise)
-    candidates = _precise_paths(m, k) + ([] if precise else ['block'])
+        return _static_path(m, k, precise, groups)
+    candidates = _precise_paths(m, k, groups) + ([] if precise else ['block'])
     label = f"INT8 path {m}x{n}x{k}{f' ConvRot {group}' if group else ''}{f' {act}' if act else ''}{' (precise)' if precise else ''}"
     started = time.time()
     print(f"[WGPKernels] Autotuning {label}...", flush=True)
@@ -455,7 +488,8 @@ def _reference(x, w, s, bias, group, act, act_weight, eps, residual, residual_sc
         v = _reference_rotation(v, group)
     if round_input:
         v = v.to(x.dtype).float()
-    out = v @ (w.float() * s[:, None]).T + bias.float()
+    scale = s.repeat_interleave(128, dim=1)[:, :w.shape[1]] if s.dim() == 2 else s[:, None]  # per (n, k-block) or per channel
+    out = v @ (w.float() * scale).T + bias.float()
     return out if residual is None else residual.float() + (1 if residual_scale is None else residual_scale.float()) * out
 
 
@@ -463,14 +497,17 @@ def selftest(device=None):
     """Runs every kernel once on small inputs with fixed configurations (no tuning): None when the results match PyTorch, else a reason."""
     device = torch.device("cuda", torch.cuda.current_device()) if device is None else torch.device(device)
     generator = torch.Generator(device=device).manual_seed(0)
-    variants = {"exact": 7, "block": 11, "row": 6}
+    variants = {"exact": 7, "block": 11, "row": 6, "exact+g": 14, "block+g": 13}
     cases = ((1, "lines", 0, None, False), (5, "small", 0, None, False), (5, "small", 64, None, False), (40, "exact", 0, None, False),
              (40, "block", 256, None, False), (40, "row", 16, None, False), (2, "lines", 0, "swiglu", True), (5, "small", 64, "rms_norm", True),
              (40, "exact", 256, "rms_norm", False), (40, "block", 0, "swiglu", True), (40, "block", 16, "rms_norm", True), (40, "exact", 64, None, True),
              (3, "lines", 64, "gelu", False), (5, "small", 0, "gelu", True), (40, "exact", 16, "gelu", False), (40, "block", 256, "gelu", True))
+    if _weight_groups:  # weights with per-(n, k-block) scales
+        cases += ((40, "exact+g", 0, None, True), (40, "block+g", 64, "rms_norm", False), (40, "block+g", 0, None, True))
     for dtype in (torch.bfloat16, torch.float16):
         w = torch.randint(-127, 128, (96, 256), dtype=torch.int8, device=device, generator=generator)
         s = torch.rand(96, device=device, generator=generator) / 127
+        s_groups = torch.rand(96, 2, device=device, generator=generator) / 127
         bias = torch.randn(96, dtype=dtype, device=device, generator=generator)
         norm_weight = (torch.rand(256, device=device, generator=generator) + 0.5).to(dtype)
         for m, path, group, act, with_residual in cases:
@@ -478,15 +515,16 @@ def selftest(device=None):
             act_weight = norm_weight if act == "rms_norm" else None
             residual = torch.randn(m, 96, dtype=dtype, device=device, generator=generator) * 4 if with_residual else None
             residual_scale = torch.rand(96, dtype=dtype, device=device, generator=generator) if with_residual else None
-            ref = _reference(x, w, s, bias, group, act, act_weight, 1e-6, residual, residual_scale, path in ("lines", "small"))
-            prepared = prepare(x, group, path, act, act_weight, 1e-6)
+            scale = s_groups if path.endswith("+g") else s
+            ref = _reference(x, w, scale, bias, group, act, act_weight, 1e-6, residual, residual_scale, path in ("lines", "small"))
+            prepared = prepare(x, group, path.removesuffix("+g"), act, act_weight, 1e-6)
             if path in ("lines", "small"):
-                y = linear_prepared(prepared, w, s, bias, residual, residual_scale, residual)  # in place of the residual
+                y = linear_prepared(prepared, w, scale, bias, residual, residual_scale, residual)  # in place of the residual
             else:
-                y = gemm(prepared.x, prepared.lo, prepared.scale, w, s, bias, dtype, 0, variants[path], out=residual, residual=residual,
+                y = gemm(prepared.x, prepared.lo, prepared.scale, w, scale, bias, dtype, 0, variants[path], out=residual, residual=residual,
                          residual_scale=residual_scale)
             error = ((y.float() - ref).norm() / ref.norm()).item()
-            if not error < (5e-3 if path in ("lines", "small", "exact") else 3e-2):
+            if not error < (5e-3 if path in ("lines", "small", "exact", "exact+g") else 3e-2):
                 return f"{path} kernel mismatch ({dtype}, {m} rows, group {group}, {act or 'no input op'}{', residual' if with_residual else ''}): relative error {error:.3g}"
     torch.cuda.synchronize(device)
     return None

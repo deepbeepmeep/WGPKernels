@@ -12,13 +12,13 @@ import tempfile
 from pathlib import Path
 
 PACKAGE = Path(__file__).resolve().parent
-# SASS for every listed architecture plus PTX for the newest, so later GPUs JIT once. Turing (sm_75) runs the INT8 kernels with synchronous copies and m8n8k16 MMAs;
-# the activation / convolution library needs SM80.
+# SASS for every listed architecture plus PTX for the newest, so later GPUs JIT once. Turing (sm_75) runs the INT8 kernels with synchronous copies and m8n8k16 MMAs,
+# and the FP8 kernels on E4M3 decoded to FP16 (E4M3 tensor cores from sm_89); the activation / convolution library needs SM80.
 DEFAULT_ARCHS = "all"
-MIN_ARCH = {"int8": 75, "ops": 80}
+MIN_ARCH = {"int8": 75, "ops": 80, "fp8": 75}
 DEFAULT_HIP_ARCHS = "gfx1200,gfx1201"  # RDNA4: the AMD targets need rocWMMA's gfx12 WMMA
 # library name -> CUDA source, relative to the package
-LIBRARIES = {"int8": "int8/int8_gemm.cu", "ops": "ops/ops.cu"}
+LIBRARIES = {"int8": "int8/int8_gemm.cu", "ops": "ops/ops.cu", "fp8": "fp8/fp8_gemm.cu"}
 
 
 def library_file(name):

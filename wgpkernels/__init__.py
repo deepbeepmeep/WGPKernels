@@ -4,6 +4,7 @@ version at run time; PyTorch supplies the tensors and the current stream).
 
 Kernel families:
 - wgpkernels.int8: INT8 weight linears (Quanto INT8 and ConvRot checkpoints).
+- wgpkernels.fp8: FP8 (E4M3) block-scaled linears for FP8 checkpoints (DeepGEMM / CUTLASS GemmBlockwise semantics).
 - wgpkernels.ops: AdaLN, PixelNorm + SiLU, FP32-accumulating valid Conv3D (CUDA).
 """
-__version__ = "1.3.0"
+__version__ = "1.4.0"

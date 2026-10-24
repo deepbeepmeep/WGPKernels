@@ -25,6 +25,10 @@ GPU, so it is timed once per GPU, layer shape and token-count bucket, and cached
 `precise=True` keeps a full-precision path at every length, for layers whose activations need it (for example language models with
 massive activations).
 
+Group-quantized INT8 checkpoints, with one FP32 scale per output channel and 128-element block of K (`scale` of shape `(N, K / 128)`, for
+example Hunyuan's group-128 INT8 DiT), run the `exact` and `block` paths: each block's exact INT32 sums are scaled by their weight scale
+(and activation block scale) into FP32 accumulators. `linear()` takes such scales directly; the few-token paths need per-channel scales.
+
 Autotuning prints a start message and the selected choice, without listing candidate timings or nested tile searches. Cache hits are
 silent and survive restarts. INT8 path selection uses exact token counts through 16, groups of 8 through 128, then groups of 64 through
 4096. GEMM tile selection uses groups of 64 through 4096, then buckets of 8192 and 16384; larger inputs reuse the 16384 bucket. Layer
@@ -43,20 +47,22 @@ reach 7-13%.
 
 ## Requirements
 
-- NVIDIA GPU with compute capability 7.5 or newer for the INT8 kernels (RTX 20XX, Quadro RTX, T4, then RTX 30XX, 40XX, 50XX, A100, H100,
-  B200 and later; GTX 16XX, without tensor cores, is untested), 8.0 or newer for the activation / convolution kernels, Windows or Linux x86_64.
+- NVIDIA GPU with compute capability 7.5 or newer for the INT8 and FP8 kernels (RTX 20XX, Quadro RTX, T4, then RTX 30XX, 40XX, 50XX, A100,
+  H100, B200 and later; GTX 16XX, without tensor cores, is untested), 8.0 or newer for the activation / convolution kernels, Windows or Linux
+  x86_64.
 - PyTorch with CUDA, Python 3.10 or newer.
 - Driver: R570 or newer for the CUDA 12.8 builds (`+cu128`), R580 or newer for the CUDA 13 builds (`+cu130`).
 - Linux: glibc 2.34 or newer (Ubuntu 22.04, Debian 12, RHEL 9 or later).
 
-Source builds include every base target supported by the selected CUDA toolkit (SM75+ for the INT8 library, SM80+ for the activation /
-convolution library), plus PTX for its newest target. On Turing (SM75) the INT8 kernels use synchronous copies and m8n8k16 MMAs.
+Source builds include every base target supported by the selected CUDA toolkit (SM75+ for the INT8 and FP8 libraries, SM80+ for the
+activation / convolution library), plus PTX for its newest target. On Turing (SM75) the INT8 kernels use synchronous copies and m8n8k16
+MMAs.
 Validation was performed on an RTX 5090; on other GPUs, run `selftest()` (WanGP does it before selecting the INT8 kernels).
 
 **AMD (experimental)**: a HIP build for RDNA4 (`gfx1200`, `gfx1201`) on Windows and Linux with PyTorch 2.13.0 / ROCm 10.0. The INT8 GEMM
 uses rocWMMA (row, `exact` and `block` modes as whole tiles, without the split-K schedule); the few-token paths use GEMV with FP32
-accumulation. Both wheels pass installation and library-loading checks. AMD kernel execution, numerical precision, speed, memory
-usage and graph replay remain unvalidated, so `selftest()` decides whether the kernels can be used.
+accumulation; the FP8 GEMM uses rocWMMA's gfx12 FP8 WMMA. Both wheels pass installation and library-loading checks. AMD kernel execution,
+numerical precision, speed, memory usage and graph replay remain unvalidated, so `selftest()` decides whether the kernels can be used.
 
 ## Installation
 
@@ -64,17 +70,17 @@ Pick the wheel matching your platform and CUDA stack. A wheel serves every Pytho
 
 ```bash
 # Windows, PyTorch with CUDA 13 (e.g. PyTorch 2.10)
-pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.1.2/wgpkernels-1.1.2%2Bcu130-py3-none-win_amd64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.0/wgpkernels-1.4.0%2Bcu130-py3-none-win_amd64.whl
 # Windows, PyTorch with CUDA 12.8 (e.g. PyTorch 2.7.1)
-pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.1.2/wgpkernels-1.1.2%2Bcu128-py3-none-win_amd64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.0/wgpkernels-1.4.0%2Bcu128-py3-none-win_amd64.whl
 # Linux, PyTorch with CUDA 13
-pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.1.2/wgpkernels-1.1.2%2Bcu130-py3-none-linux_x86_64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.0/wgpkernels-1.4.0%2Bcu130-py3-none-linux_x86_64.whl
 # Linux, PyTorch with CUDA 12.8
-pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.1.2/wgpkernels-1.1.2%2Bcu128-py3-none-linux_x86_64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.0/wgpkernels-1.4.0%2Bcu128-py3-none-linux_x86_64.whl
 # Windows, AMD RDNA4 with PyTorch 2.13.0 / ROCm 10.0 (experimental)
-pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.1.2/wgpkernels-1.1.2%2Brocm100-py3-none-win_amd64.whl
+pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.0/wgpkernels-1.4.0%2Brocm100-py3-none-win_amd64.whl
 # Linux, AMD RDNA4 with PyTorch 2.13.0 / ROCm 10.0 (experimental)
-pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.1.2/wgpkernels-1.1.2%2Brocm100-py3-none-linux_x86_64.whl
+pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.0/wgpkernels-1.4.0%2Brocm100-py3-none-linux_x86_64.whl
 ```
 
 ## Usage
@@ -103,6 +109,34 @@ q = wq.linear_prepared(prepared, weight, scale)
 Activations are 2-D BF16 or FP16 tensors with contiguous rows aligned on 16 bytes; K must be a multiple of 16. Calls are compatible with
 CUDA graph capture once a shape has run eagerly (its tuning is then cached); during capture or `torch.compile` tracing, fixed
 thresholds replace the timing.
+
+## FP8 block-scaled linears
+
+`wgpkernels.fp8` runs FP8 (E4M3) checkpoints whose weights carry FP32 scales per 128 x 128 block (DeepGEMM's `per_block_cast_to_fp8`),
+per output channel and 128-element block of K, per output channel or per tensor, with the semantics of DeepGEMM's FP8 GEMM and CUTLASS's
+`GemmBlockwise`: each 128-element block of K
+is accumulated from zero in FP32, then scaled by its activation and weight scales into FP32 accumulators. Activations are quantized to
+E4M3 with one scale per token and 128-element block (`amax / 448`, as DeepGEMM's `per_token_cast_to_fp8`), or optionally one scale per
+128 x 128 tile (the activation scaling of Hunyuan's sm89 CUTLASS path).
+
+- RTX 40/50 (SM89, SM120): E4M3 tensor cores (on H100 and datacenter Blackwell, ptxas runs the same instruction on FP16 tensor cores).
+  RTX 30, A100 (SM80-88) and Turing (SM75): E4M3 decoded exactly to FP16 in registers (FP16 tensor cores, FP32 accumulation). AMD RDNA4
+  (experimental, kernel execution unvalidated): rocWMMA's gfx12 FP8 WMMA.
+- Persistent tiles with stream-K; the results are deterministic. Bias and residual epilogue as for the INT8 kernels.
+- These are approximate kernels: FP8 activations give about 2.5e-2 relative error per layer (about 1e-2 when activations have outlier
+  channels), against about 2.5e-3 for FP8 weights with BF16 activations.
+- RTX 4090, 8k-36k tokens at hidden size 4096 / MLP 12288: 296-312 TFLOPS for the GEMM, 1.60-1.76x the speed of a cuBLAS BF16 matmul
+  including the activation quantization.
+
+```python
+from wgpkernels import fp8
+
+fp8.load_library()
+assert fp8.selftest() is None
+y = fp8.linear(x, fp8_weight, fp8_scale)           # E4M3 (N, K) weight, FP32 (ceil(N / 128), ceil(K / 128)) scales
+q, sa = fp8.quantize_blocks(x)                     # or quantize once for several weights...
+y = fp8.gemm(q, sa, fp8_weight, fp8_scale, bias)   # ...and run the GEMM on the E4M3 activations
+```
 
 ## Building from source
 
@@ -163,6 +197,7 @@ the versions nvcc accepts) or gcc (Linux).
 ```bash
 python -m wgpkernels.build                       # every toolkit-supported SM75+ target into wgpkernels/int8/
 python -m wgpkernels.build --library ops         # SM80+ targets for activation/convolution kernels
+python -m wgpkernels.build --library fp8         # SM75+ targets for the FP8 kernels (--hip <ROCm SDK root> for RDNA4)
 python -m wgpkernels.build --arch 120 --verbose  # one architecture, with register and spill report
 python -m wgpkernels.build --hip <ROCm SDK root> # AMD gfx1200 and gfx1201 with ROCm 10's hipcc
 pip install -e .                                 # editable install using the library built in place

@@ -474,6 +474,10 @@ __global__ void __launch_bounds__(256) transform_rows(const T* __restrict__ x, T
 // A: (M, K) row-major INT8 activations with per-row scales. B: (N, K) row-major INT8 weights with per-column scales.
 // With HILO, A has a second residual operand sharing the row scales: acc_hi + acc_lo / 254.
 //
+// WGROUP: B has one scale per output channel and 128-element K block, sb (N, ceil(K / 128)) (group-quantized checkpoints): each block's
+// exact INT32 sums (hi + lo / 254 with HILO) are promoted with sb[n, kb] (and the activation block scale with BLOCKS) into FP32
+// accumulators, as the BLOCKS mode does with its activation scales; without BLOCKS the row scales apply in the epilogue.
+//
 // Persistent CTAs process whole tiles in waves. The tiles of an incomplete last wave are split along K over the CTAs
 // (stream-K): each piece stores its exact INT32 partial sums in its own workspace slot and the last piece to arrive adds
 // the others and applies the epilogue. Integer sums make the result independent of arrival order; no CTA ever waits.
@@ -505,7 +509,7 @@ template<int CHUNKS> DEVICE int swizzle(int r, int c) {
 
 DEVICE int sk_cta_of(long long unit, const Schedule& s) { return int(((unit + 1) * s.sk_ctas - 1) / s.sk_units); }
 
-template<class T, int BM, int BN, int BK, int WM, int WN, int STAGES, bool HILO, int CTAS, bool BLOCKS>
+template<class T, int BM, int BN, int BK, int WM, int WN, int STAGES, bool HILO, int CTAS, bool BLOCKS, bool WGROUP = false>
 __global__ void __launch_bounds__(GemmConfig<BM, BN, BK, WM, WN, STAGES, HILO>::THREADS, CTAS)
 gemm_s8(const int8_t* __restrict__ a, const int8_t* __restrict__ a_lo, const float* __restrict__ sa,
         const int8_t* __restrict__ b, const float* __restrict__ sb, const T* __restrict__ bias, const T* residual, const T* __restrict__ rscale,
@@ -522,13 +526,17 @@ gemm_s8(const int8_t* __restrict__ a, const int8_t* __restrict__ a_lo, const flo
 
     int acc[C::ACC][MI][NI][4];
     // BLOCKS: sa holds one scale per row and 128-element K block. Each block's exact INT32 sums are scaled into FP32 accumulators.
+    // WGROUP: so are they with the weight scales of the block (FOLD: either).
+    constexpr bool FOLD = BLOCKS || WGROUP;
     constexpr int KPB = 128 / BK;  // k-tiles per scale block
-    float accf[BLOCKS ? MI : 1][BLOCKS ? NI : 1][4];
-    // The scales of a block's BM rows come with the stage of its first k-tile (cp.async: no registers held while in flight) into a ring
-    // of three blocks; the slot of block b is refilled for block b + 3, whose stage is issued after every warp folded block b.
-    __shared__ float block_scales[BLOCKS ? 3 : 1][BLOCKS ? BM : 1];
+    float accf[FOLD ? MI : 1][FOLD ? NI : 1][4];
+    // The scales of a block's BM rows (and then of the tile's BN columns) come with the stage of its first k-tile (cp.async: no registers
+    // held while in flight) into a ring of three blocks; the slot of block b is refilled for block b + 3, whose stage is issued after every
+    // warp folded block b.
+    __shared__ __align__(16) float block_scales[FOLD ? 3 : 1][FOLD ? BM + (WGROUP ? BN : 0) : 1];  // float2 column scale reads
+    static_assert(!WGROUP || BM + BN <= C::THREADS, "one thread per scale of a block");
     const int kblocks = (k + 127) / 128;
-    int work_m0 = 0, work_kb = 0;
+    int work_m0 = 0, work_n0 = 0, work_kb = 0;
 
     auto tile_origin = [&](int t, int& m0, int& n0) {
         // Grouped rasterization keeps a band of A rows and the B columns it meets resident in L2.
@@ -567,6 +575,7 @@ gemm_s8(const int8_t* __restrict__ a, const int8_t* __restrict__ a_lo, const flo
     bool a_ok[C::A_PER], b_ok[C::B_PER];
     auto setup = [&](const Work& w) {
         work_m0 = w.m0;
+        work_n0 = w.n0;
         work_kb = w.kb;
         #pragma unroll
         for (int i = 0; i < C::A_PER; ++i) {
@@ -581,11 +590,15 @@ gemm_s8(const int8_t* __restrict__ a, const int8_t* __restrict__ a_lo, const flo
             b_src[i] = b + (b_ok[i] ? int64_t(r) * k + chunk * 16 : 0);
         }
     };
-    // BLOCKS: the activation scales of k-tile kt's block, with the tile that starts the block (or the work)
+    // BLOCKS / WGROUP: the activation / weight scales of k-tile kt's block, with the tile that starts the block (or the work)
     auto load_scales = [&](int kt) {
         if (BLOCKS && (kt % KPB == 0 || kt == work_kb) && tid < BM) {
             const int row = work_m0 + tid;
             cp_async4(smem_u32(&block_scales[(kt / KPB) % 3][tid]), row < m ? sa + int64_t(row) * kblocks + kt / KPB : sa, row < m);
+        }
+        if (WGROUP && (kt % KPB == 0 || kt == work_kb) && tid >= BM && tid < BM + BN) {
+            const int col = work_n0 + tid - BM;
+            cp_async4(smem_u32(&block_scales[(kt / KPB) % 3][tid]), col < n ? sb + int64_t(col) * kblocks + kt / KPB : sb, col < n);
         }
     };
     auto load_stage = [&](int slot, int kt) {
@@ -683,8 +696,8 @@ gemm_s8(const int8_t* __restrict__ a, const int8_t* __restrict__ a_lo, const flo
                 #pragma unroll
                 for (int ni = 0; ni < NI; ++ni)
                     #pragma unroll
-                    for (int j = 0; j < 4; ++j) acc[h][mi][ni][j] = BLOCKS ? BLOCK_BIAS : 0;
-        if (BLOCKS) {
+                    for (int j = 0; j < 4; ++j) acc[h][mi][ni][j] = FOLD ? BLOCK_BIAS : 0;
+        if (FOLD) {
             #pragma unroll
             for (int mi = 0; mi < MI; ++mi)
                 #pragma unroll
@@ -697,9 +710,9 @@ gemm_s8(const int8_t* __restrict__ a, const int8_t* __restrict__ a_lo, const flo
         load_frags(0, 0, 0);
         int slot = 0;
         for (int kt = w.kb; kt < w.ke;) {
-            // BLOCKS: the k-tiles of one scale block, then its fold, once and unpredicated (a fold inside the k-tile loop is issued,
+            // BLOCKS / WGROUP: the k-tiles of one scale block, then its fold, once and unpredicated (a fold inside the k-tile loop is issued,
             // predicated off, on every k-tile).
-            const int block_end = BLOCKS ? min(w.ke, (kt / KPB + 1) * KPB) : w.ke;
+            const int block_end = FOLD ? min(w.ke, (kt / KPB + 1) * KPB) : w.ke;
             for (; kt < block_end; ++kt) {
                 #pragma unroll
                 for (int ks = 0; ks < C::KSTEPS; ++ks) {
@@ -733,7 +746,7 @@ gemm_s8(const int8_t* __restrict__ a, const int8_t* __restrict__ a_lo, const flo
                 }
                 slot = (slot + 1) % STAGES;
             }
-            if (BLOCKS) {
+            if (BLOCKS && !WGROUP) {
                 const float* scales = block_scales[((kt - 1) / KPB) % 3] + warp_m * WM + g;
                 #pragma unroll
                 for (int mi = 0; mi < MI; ++mi) {
@@ -745,6 +758,27 @@ gemm_s8(const int8_t* __restrict__ a, const int8_t* __restrict__ a_lo, const flo
                     }
                 }
             }
+            if (WGROUP) {
+                // accf += (hi [+ lo / 254]) * sa[row, kb] (BLOCKS) * sb[col, kb] for every element; the sums restart at the bias.
+                const float* ring = block_scales[((kt - 1) / KPB) % 3];
+                float2 col_scales[NI];
+                #pragma unroll
+                for (int ni = 0; ni < NI; ++ni) col_scales[ni] = *reinterpret_cast<const float2*>(ring + BM + warp_n * WN + ni * 8 + t4 * 2);
+                #pragma unroll
+                for (int mi = 0; mi < MI; ++mi) {
+                    const float s0 = BLOCKS ? ring[warp_m * WM + mi * 16 + g] : 1.f, s1 = BLOCKS ? ring[warp_m * WM + mi * 16 + 8 + g] : 1.f;
+                    #pragma unroll
+                    for (int ni = 0; ni < NI; ++ni)
+                        #pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            float v = __int_as_float(acc[0][mi][ni][j]) - 12582912.f;
+                            if (HILO) v = fmaf(__int_as_float(acc[C::ACC - 1][mi][ni][j]) - 12582912.f, 1.f / 254.f, v);
+                            accf[mi][ni][j] = fmaf(v, (j < 2 ? s0 : s1) * (j & 1 ? col_scales[ni].y : col_scales[ni].x), accf[mi][ni][j]);
+                            #pragma unroll
+                            for (int h = 0; h < C::ACC; ++h) acc[h][mi][ni][j] = BLOCK_BIAS;
+                        }
+                }
+            }
         }
         __syncthreads();  // every warp is done with shared memory before the next prologue refills it
     };
@@ -754,7 +788,7 @@ gemm_s8(const int8_t* __restrict__ a, const int8_t* __restrict__ a_lo, const flo
         #pragma unroll
         for (int ni = 0; ni < NI; ++ni) {
             const int col = n0 + warp_n * WN + ni * 8 + t4 * 2;
-            col_scale[ni] = col + 1 < n ? *reinterpret_cast<const float2*>(sb + col) : make_float2(col < n ? sb[col] : 0.f, 0.f);
+            col_scale[ni] = WGROUP ? make_float2(1.f, 1.f) : col + 1 < n ? *reinterpret_cast<const float2*>(sb + col) : make_float2(col < n ? sb[col] : 0.f, 0.f);
             col_bias[ni] = make_float2(bias && col < n ? to_float(bias[col]) : 0.f, bias && col + 1 < n ? to_float(bias[col + 1]) : 0.f);
         }
         float row_scale[MI][2];
@@ -766,8 +800,8 @@ gemm_s8(const int8_t* __restrict__ a, const int8_t* __restrict__ a_lo, const flo
                 row_scale[mi][half] = BLOCKS ? 1.f : row < m ? sa[row] : 0.f;
             }
         auto value = [&](int mi, int ni, int half, int e) {
-            float v = BLOCKS ? accf[mi < MI ? mi : 0][BLOCKS ? ni : 0][half * 2 + e] : float(acc[0][mi][ni][half * 2 + e]);
-            if (HILO) v = fmaf(float(acc[C::ACC - 1][mi][ni][half * 2 + e]), 1.f / 254.f, v);
+            float v = FOLD ? accf[mi < MI ? mi : 0][FOLD ? ni : 0][half * 2 + e] : float(acc[0][mi][ni][half * 2 + e]);
+            if (HILO && !FOLD) v = fmaf(float(acc[C::ACC - 1][mi][ni][half * 2 + e]), 1.f / 254.f, v);
             return fmaf(v * row_scale[mi][half], e ? col_scale[ni].y : col_scale[ni].x, e ? col_bias[ni].y : col_bias[ni].x);
         };
         // Both outputs of a fragment pair, with the residual (read before the tile is written: y may be the residual itself).
@@ -842,26 +876,26 @@ gemm_s8(const int8_t* __restrict__ a, const int8_t* __restrict__ a_lo, const flo
             const int first = sk_cta_of((long long)w.j * sched.k_tiles, sched), last = sk_cta_of((long long)(w.j + 1) * sched.k_tiles - 1, sched);
             if (first != last) {
                 // Slot blockIdx.x + j is unique: CTA ranges are increasing, so no other CTA/tile pair has the same sum.
-                constexpr int VECS = C::ACC * MI * NI;
+                constexpr int PARTS = FOLD ? 1 : C::ACC, VECS = PARTS * MI * NI;
                 int4* slots = reinterpret_cast<int4*>(workspace);
                 int4* own = slots + int64_t(blockIdx.x + w.j) * VECS * C::THREADS + tid;
                 #pragma unroll
-                for (int h = 0; h < C::ACC; ++h)
+                for (int h = 0; h < PARTS; ++h)
                     #pragma unroll
                     for (int mi = 0; mi < MI; ++mi)
                         #pragma unroll
                         for (int ni = 0; ni < NI; ++ni)
                             __stcg(own + ((h * MI + mi) * NI + ni) * C::THREADS,
-                                   BLOCKS ? *reinterpret_cast<const int4*>(accf[mi][ni]) : *reinterpret_cast<const int4*>(acc[h][mi][ni]));
+                                   FOLD ? *reinterpret_cast<const int4*>(accf[mi][ni]) : *reinterpret_cast<const int4*>(acc[h][mi][ni]));
                 __threadfence();
                 __syncthreads();
                 if (!tid) s_last = atomicAdd(counters + w.j, 1) == last - first;
                 __syncthreads();
                 if (!s_last) return;
                 __threadfence();
-                if (BLOCKS) {
+                if (FOLD) {
                     // Floating-point sums: add the pieces in CTA order, this one included, whichever arrives last.
-                    float sum[BLOCKS ? MI : 1][BLOCKS ? NI : 1][4] = {};
+                    float sum[FOLD ? MI : 1][FOLD ? NI : 1][4] = {};
                     for (int c = first; c <= last; ++c) {
                         const int4* piece = slots + int64_t(c + w.j) * VECS * C::THREADS + tid;
                         #pragma unroll
@@ -881,7 +915,7 @@ gemm_s8(const int8_t* __restrict__ a, const int8_t* __restrict__ a_lo, const flo
                             #pragma unroll
                             for (int j = 0; j < 4; ++j) accf[mi][ni][j] = sum[mi][ni][j];
                 }
-                for (int c = first; c <= last && !BLOCKS; ++c) {
+                for (int c = first; c <= last && !FOLD; ++c) {
                     if (c == int(blockIdx.x)) continue;
                     const int4* other = slots + int64_t(c + w.j) * VECS * C::THREADS + tid;
                     #pragma unroll
@@ -1096,7 +1130,7 @@ template<int BM, bool HILO> struct WmmaLds {
     static constexpr int A = BM * WMMA_LD, B = WMMA_BN * WMMA_LD, STAGE = A * (HILO ? 2 : 1) + B, BYTES = 2 * STAGE;
 };
 
-template<class T, int BM, bool HILO, bool BLOCKS>
+template<class T, int BM, bool HILO, bool BLOCKS, bool WGROUP = false>
 __global__ void __launch_bounds__(256) gemm_s8_wmma(const int8_t* __restrict__ a, const int8_t* __restrict__ a_lo, const float* __restrict__ sa,
                                                     const int8_t* __restrict__ b, const float* __restrict__ sb, const T* __restrict__ bias,
                                                     const T* residual, const T* __restrict__ rscale, T* y, int m, int n, int k) {
@@ -1154,15 +1188,16 @@ __global__ void __launch_bounds__(256) gemm_s8_wmma(const int8_t* __restrict__ a
         }
     };
 
+    constexpr bool FOLD = BLOCKS || WGROUP;  // block sums promoted with their activation (BLOCKS) / weight (WGROUP) scales
     FragC acc[FM][FN], acc_lo[HILO ? FM : 1][HILO ? FN : 1];
-    float accf[BLOCKS ? FM : 1][BLOCKS ? FN : 1][WMMA_ELEMS];
+    float accf[FOLD ? FM : 1][FOLD ? FN : 1][WMMA_ELEMS];
     #pragma unroll
     for (int fm = 0; fm < FM; ++fm)
         #pragma unroll
         for (int fn = 0; fn < FN; ++fn) {
             rocwmma::fill_fragment(acc[fm][fn], 0);
             if constexpr (HILO) rocwmma::fill_fragment(acc_lo[fm][fn], 0);
-            if constexpr (BLOCKS)
+            if constexpr (FOLD)
                 #pragma unroll
                 for (int i = 0; i < WMMA_ELEMS; ++i) accf[fm][fn][i] = 0.f;
         }
@@ -1192,21 +1227,32 @@ __global__ void __launch_bounds__(256) gemm_s8_wmma(const int8_t* __restrict__ a
                 }
             }
         }
-        if constexpr (BLOCKS) if (kt % 2 == 1 || kt + 1 == k_tiles) {
-            // The block's exact INT32 sums (|sum| < 2^22) times the row's block scale, into the FP32 accumulators.
+        if constexpr (FOLD) if (kt % 2 == 1 || kt + 1 == k_tiles) {
+            // The block's exact INT32 sums (|sum| < 2^22; hi + lo / 254 with HILO) times the row's block scale (BLOCKS) and the column's
+            // block weight scale (WGROUP), into the FP32 accumulators.
             #pragma unroll
             for (int fm = 0; fm < FM; ++fm) {
                 float scale[WMMA_ELEMS];
                 #pragma unroll
                 for (int i = 0; i < WMMA_ELEMS; ++i) {
                     const int row = m0 + warp_m * WM + fm * 16 + coords[i] / 16;
-                    scale[i] = row < m ? sa[int64_t(row) * kblocks + kt / 2] : 0.f;
+                    scale[i] = row < m ? (BLOCKS ? sa[int64_t(row) * kblocks + kt / 2] : 1.f) : 0.f;
                 }
                 #pragma unroll
                 for (int fn = 0; fn < FN; ++fn) {
                     #pragma unroll
-                    for (int i = 0; i < WMMA_ELEMS; ++i) accf[fm][fn][i] = fmaf(float(acc[fm][fn][i]), scale[i], accf[fm][fn][i]);
+                    for (int i = 0; i < WMMA_ELEMS; ++i) {
+                        float v = float(acc[fm][fn][i]);
+                        if constexpr (HILO) v = fmaf(float(acc_lo[fm][fn][i]), 1.f / 254.f, v);
+                        float s = scale[i];
+                        if constexpr (WGROUP) {
+                            const int col = n0 + warp_n * WN + fn * 16 + coords[i] % 16;
+                            s *= col < n ? sb[int64_t(col) * kblocks + kt / 2] : 0.f;
+                        }
+                        accf[fm][fn][i] = fmaf(v, s, accf[fm][fn][i]);
+                    }
                     rocwmma::fill_fragment(acc[fm][fn], 0);
+                    if constexpr (HILO) rocwmma::fill_fragment(acc_lo[fm][fn], 0);
                 }
             }
         }
@@ -1226,11 +1272,11 @@ __global__ void __launch_bounds__(256) gemm_s8_wmma(const int8_t* __restrict__ a
                 const int r = warp_m * WM + fm * 16 + coords[i] / 16, c = warp_n * WN + fn * 16 + coords[i] % 16;
                 const int row = m0 + r, col = n0 + c;
                 float v;
-                if constexpr (BLOCKS) v = accf[fm][fn][i]; else v = float(acc[fm][fn][i]);
-                if constexpr (HILO) v = fmaf(float(acc_lo[fm][fn][i]), 1.f / 254.f, v);
+                if constexpr (FOLD) v = accf[fm][fn][i]; else v = float(acc[fm][fn][i]);
+                if constexpr (HILO && !FOLD) v = fmaf(float(acc_lo[fm][fn][i]), 1.f / 254.f, v);
                 float out = 0.f;
                 if (row < m && col < n) {
-                    out = fmaf(v * (BLOCKS ? 1.f : sa[row]), sb[col], bias ? to_float(bias[col]) : 0.f);
+                    out = fmaf(v * (BLOCKS ? 1.f : sa[row]), WGROUP ? 1.f : sb[col], bias ? to_float(bias[col]) : 0.f);
                     if (residual) out = fmaf(out, rscale ? to_float(rscale[col]) : 1.f, to_float(residual[int64_t(row) * n + col]));
                 }
                 tile[r * LDO + c] = T(out);
@@ -1242,11 +1288,11 @@ __global__ void __launch_bounds__(256) gemm_s8_wmma(const int8_t* __restrict__ a
     }
 }
 
-template<class T, int BM, bool HILO, bool BLOCKS>
+template<class T, int BM, bool HILO, bool BLOCKS, bool WGROUP = false>
 int launch_gemm_wmma(const int8_t* a, const int8_t* a_lo, const float* sa, const int8_t* b, const float* sb, const void* bias, const void* residual,
                      const void* rscale, void* y, int m, int n, int k, cudaStream_t stream) {
     const dim3 grid((n + WMMA_BN - 1) / WMMA_BN, (m + BM - 1) / BM);
-    gemm_s8_wmma<T, BM, HILO, BLOCKS><<<grid, 256, 0, stream>>>(a, a_lo, sa, b, sb, static_cast<const T*>(bias), static_cast<const T*>(residual),
+    gemm_s8_wmma<T, BM, HILO, BLOCKS, WGROUP><<<grid, 256, 0, stream>>>(a, a_lo, sa, b, sb, static_cast<const T*>(bias), static_cast<const T*>(residual),
                                                                 static_cast<const T*>(rscale), static_cast<T*>(y), m, n, k);
     return int(cudaGetLastError());
 }
@@ -1263,6 +1309,9 @@ int launch_gemm_wmma(const int8_t* a, const int8_t* a_lo, const float* sa, const
 #endif
 
 API int wq8_abi() { return 11; }
+// Optional features of this build (bit 0: per-(n, k-block) weight scales, GEMM variants 12-14), so that a newer Python layer can tell an
+// older library apart without an ABI change for current callers.
+API int wq8_features() { return 1; }
 
 template<class T, int GROUP, bool HILO, int ACT>
 int launch_quantize(const void* x, int8_t* hi, int8_t* lo, float* scale, int m, int k, int64_t ldx, const void* act_weight, float eps, cudaStream_t stream) {
@@ -1317,15 +1366,20 @@ API int wq8_quantize(const void* x, int8_t* hi, int8_t* lo, float* scale, int m,
 #if !WGP_AMD
 // Tile configurations: 0 = 128x256 (8 warps of 64x64), 2 = 128x128 (8 warps of 64x32), 6 = 64x128 (8 warps of 32x32);
 // 1 and 7 are the 128x128 and 64x128 HILO tiles (two accumulators), 10 and 11 the 128x128 and 64x128 per-block-scale tiles. CTAS: CTAs per SM (two 4-warp 128x128 CTAs, 3 or 4 stages
-// and 3-stage 128x256 tiles were measured slower).
+// and 3-stage 128x256 tiles were measured slower). Weights with per-(n, k-block) scales: 12 and 13 = 10 and 11, 14 = 7 (HILO, row
+// activation scales).
 template<int V> struct Variant;
-template<> struct Variant<0> { static constexpr int BM = 128, BN = 256, BK = 64, WM = 64, WN = 64, STAGES = 4, CTAS = 1; static constexpr bool HILO = false, BLOCKS = false; };
-template<> struct Variant<1> { static constexpr int BM = 128, BN = 128, BK = 64, WM = 64, WN = 32, STAGES = 4, CTAS = 1; static constexpr bool HILO = true, BLOCKS = false; };
-template<> struct Variant<2> { static constexpr int BM = 128, BN = 128, BK = 64, WM = 64, WN = 32, STAGES = 4, CTAS = 1; static constexpr bool HILO = false, BLOCKS = false; };
-template<> struct Variant<6> { static constexpr int BM = 64, BN = 128, BK = 64, WM = 32, WN = 32, STAGES = 4, CTAS = 1; static constexpr bool HILO = false, BLOCKS = false; };
-template<> struct Variant<10> { static constexpr int BM = 128, BN = 128, BK = 64, WM = 64, WN = 32, STAGES = 4, CTAS = 1; static constexpr bool HILO = false, BLOCKS = true; };
-template<> struct Variant<11> { static constexpr int BM = 64, BN = 128, BK = 64, WM = 32, WN = 32, STAGES = 4, CTAS = 1; static constexpr bool HILO = false, BLOCKS = true; };
-template<> struct Variant<7> { static constexpr int BM = 64, BN = 128, BK = 64, WM = 32, WN = 32, STAGES = 4, CTAS = 1; static constexpr bool HILO = true, BLOCKS = false; };
+template<> struct Variant<0> { static constexpr int BM = 128, BN = 256, BK = 64, WM = 64, WN = 64, STAGES = 4, CTAS = 1; static constexpr bool HILO = false, BLOCKS = false, WGROUP = false; };
+template<> struct Variant<1> { static constexpr int BM = 128, BN = 128, BK = 64, WM = 64, WN = 32, STAGES = 4, CTAS = 1; static constexpr bool HILO = true, BLOCKS = false, WGROUP = false; };
+template<> struct Variant<2> { static constexpr int BM = 128, BN = 128, BK = 64, WM = 64, WN = 32, STAGES = 4, CTAS = 1; static constexpr bool HILO = false, BLOCKS = false, WGROUP = false; };
+template<> struct Variant<6> { static constexpr int BM = 64, BN = 128, BK = 64, WM = 32, WN = 32, STAGES = 4, CTAS = 1; static constexpr bool HILO = false, BLOCKS = false, WGROUP = false; };
+template<> struct Variant<10> { static constexpr int BM = 128, BN = 128, BK = 64, WM = 64, WN = 32, STAGES = 4, CTAS = 1; static constexpr bool HILO = false, BLOCKS = true, WGROUP = false; };
+template<> struct Variant<11> { static constexpr int BM = 64, BN = 128, BK = 64, WM = 32, WN = 32, STAGES = 4, CTAS = 1; static constexpr bool HILO = false, BLOCKS = true, WGROUP = false; };
+template<> struct Variant<7> { static constexpr int BM = 64, BN = 128, BK = 64, WM = 32, WN = 32, STAGES = 4, CTAS = 1; static constexpr bool HILO = true, BLOCKS = false, WGROUP = false; };
+template<int V> struct Grouped : Variant<V> { static constexpr bool WGROUP = true; };
+template<> struct Variant<12> : Grouped<10> {};
+template<> struct Variant<13> : Grouped<11> {};
+template<> struct Variant<14> : Grouped<7> {};
 // Turing (sm_75, 64 KiB of shared memory per CTA): register-staged copies (a k-tile is read into registers a tile ahead and stored at
 // the end of the next one). The 128x128 and 64x128 tiles have 3 stages, the 128x256 tile 2 (48 KiB; a second barrier per k-tile); the
 // 128x128 HILO tile (72 KiB with 3 stages) is replaced by the 64x128 one.
@@ -1336,6 +1390,9 @@ template<> struct Variant<106> : Stages<6, 3> {};
 template<> struct Variant<107> : Stages<7, 3> {};
 template<> struct Variant<110> : Stages<10, 3> {};
 template<> struct Variant<111> : Stages<11, 3> {};
+template<> struct Variant<112> : Stages<12, 3> {};
+template<> struct Variant<113> : Stages<13, 3> {};
+template<> struct Variant<114> : Stages<14, 3> {};
 
 // Compute capability below 8.0 of the current device (cached per device).
 static bool sm75_device() {
@@ -1361,6 +1418,9 @@ static int device_variant(int variant) {
         case 1: case 7: return 107;
         case 10: return 110;
         case 11: return 111;
+        case 12: return 112;
+        case 13: return 113;
+        case 14: return 114;
     }
     return variant;
 }
@@ -1389,7 +1449,7 @@ template<class V> Schedule make_schedule(int m, int n, int k, int sms, int split
 template<int VI> void workspace_sizes(int m, int n, int k, int sms, int split, int64_t* sizes) {
     using V = Variant<VI>;
     const Schedule s = make_schedule<V>(m, n, k, sms, split);
-    sizes[0] = s.sk_tiles ? int64_t(s.sk_ctas + s.sk_tiles) * V::BM * V::BN * 4 * (V::HILO ? 2 : 1) : 0;
+    sizes[0] = s.sk_tiles ? int64_t(s.sk_ctas + s.sk_tiles) * V::BM * V::BN * 4 * (V::HILO && !V::WGROUP ? 2 : 1) : 0;
     sizes[1] = 4 * int64_t(s.sk_tiles);
 }
 
@@ -1401,6 +1461,12 @@ API void wq8_gemm_workspace(int m, int n, int k, int variant, int sms, int split
         case 107: return workspace_sizes<107>(m, n, k, sms, split, sizes);
         case 110: return workspace_sizes<110>(m, n, k, sms, split, sizes);
         case 111: return workspace_sizes<111>(m, n, k, sms, split, sizes);
+        case 112: return workspace_sizes<112>(m, n, k, sms, split, sizes);
+        case 113: return workspace_sizes<113>(m, n, k, sms, split, sizes);
+        case 114: return workspace_sizes<114>(m, n, k, sms, split, sizes);
+        case 12: return workspace_sizes<12>(m, n, k, sms, split, sizes);
+        case 13: return workspace_sizes<13>(m, n, k, sms, split, sizes);
+        case 14: return workspace_sizes<14>(m, n, k, sms, split, sizes);
         case 1: return workspace_sizes<1>(m, n, k, sms, split, sizes);
         case 2: return workspace_sizes<2>(m, n, k, sms, split, sizes);
         case 6: return workspace_sizes<6>(m, n, k, sms, split, sizes);
@@ -1416,7 +1482,7 @@ int launch_gemm(const int8_t* a, const int8_t* a_lo, const float* sa, const int8
                 const void* rscale, void* y, int m, int n, int k, int sms, int split, int* workspace, int* counters, cudaStream_t stream) {
     using V = Variant<VI>;
     using C = GemmConfig<V::BM, V::BN, V::BK, V::WM, V::WN, V::STAGES, V::HILO>;
-    auto kernel = gemm_s8<T, V::BM, V::BN, V::BK, V::WM, V::WN, V::STAGES, V::HILO, V::CTAS, V::BLOCKS>;
+    auto kernel = gemm_s8<T, V::BM, V::BN, V::BK, V::WM, V::WN, V::STAGES, V::HILO, V::CTAS, V::BLOCKS, V::WGROUP>;
     static bool configured = false;
     if (!configured) {
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM);
@@ -1448,7 +1514,8 @@ API int wq8_gemm_select(int m, int n, int k, int hilo, int sms) {
 
 // Y (M, N) = (A (M, K) * sa) @ (B (N, K) * sb).T + bias, or with a residual R (M, N): Y = R + rscale * (... + bias) (rscale: N values or
 // null for 1), computed in FP32 and rounded once; Y may be R. K must be a multiple of 16; A, B, R, Y contiguous. Variants 10 and 11 take
-// per-block scales sa (M, ceil(K / 128)) from wq8_quantize_blocks.
+// per-block scales sa (M, ceil(K / 128)) from wq8_quantize_blocks. Variants 12 and 13 (block activations) and 14 (HILO, row scales) take
+// weight scales sb (N, ceil(K / 128)), one per output channel and 128-element block of K.
 // workspace / counters: wq8_gemm_workspace() sizes; counters zeroed, and left zeroed.
 template<class T> int dispatch_gemm(const int8_t* a, const int8_t* a_lo, const float* sa, const int8_t* b, const float* sb, const void* bias,
                                     const void* residual, const void* rscale, void* y, int m, int n, int k, int variant, int sms, int split,
@@ -1460,6 +1527,12 @@ template<class T> int dispatch_gemm(const int8_t* a, const int8_t* a_lo, const f
         case 107: return launch_gemm<T, 107>(a, a_lo, sa, b, sb, bias, residual, rscale, y, m, n, k, sms, split, workspace, counters, stream);
         case 110: return launch_gemm<T, 110>(a, a_lo, sa, b, sb, bias, residual, rscale, y, m, n, k, sms, split, workspace, counters, stream);
         case 111: return launch_gemm<T, 111>(a, a_lo, sa, b, sb, bias, residual, rscale, y, m, n, k, sms, split, workspace, counters, stream);
+        case 112: return launch_gemm<T, 112>(a, a_lo, sa, b, sb, bias, residual, rscale, y, m, n, k, sms, split, workspace, counters, stream);
+        case 113: return launch_gemm<T, 113>(a, a_lo, sa, b, sb, bias, residual, rscale, y, m, n, k, sms, split, workspace, counters, stream);
+        case 114: return launch_gemm<T, 114>(a, a_lo, sa, b, sb, bias, residual, rscale, y, m, n, k, sms, split, workspace, counters, stream);
+        case 12: return launch_gemm<T, 12>(a, a_lo, sa, b, sb, bias, residual, rscale, y, m, n, k, sms, split, workspace, counters, stream);
+        case 13: return launch_gemm<T, 13>(a, a_lo, sa, b, sb, bias, residual, rscale, y, m, n, k, sms, split, workspace, counters, stream);
+        case 14: return launch_gemm<T, 14>(a, a_lo, sa, b, sb, bias, residual, rscale, y, m, n, k, sms, split, workspace, counters, stream);
         case 1: return launch_gemm<T, 1>(a, a_lo, sa, b, sb, bias, residual, rscale, y, m, n, k, sms, split, workspace, counters, stream);
         case 2: return launch_gemm<T, 2>(a, a_lo, sa, b, sb, bias, residual, rscale, y, m, n, k, sms, split, workspace, counters, stream);
         case 6: return launch_gemm<T, 6>(a, a_lo, sa, b, sb, bias, residual, rscale, y, m, n, k, sms, split, workspace, counters, stream);
@@ -1473,7 +1546,8 @@ template<class T> int dispatch_gemm(const int8_t* a, const int8_t* a_lo, const f
 }
 #else
 // AMD: whole tiles (split and the workspace are unused); 0 / 2 / 1 = 128x128 tiles, 6 / 7 = 64x128 (row, HILO); per-block scales (10, 11)
-// use the 64x128 tile, whose INT32 and FP32 accumulators fit the 256 registers (the 128-row one spills).
+// and per-(n, k-block) weight scales (12, 13; 14 with HILO) use the 64x128 tile, whose INT32 and FP32 accumulators fit the 256 registers
+// (the 128-row one spills).
 API void wq8_gemm_workspace(int m, int n, int k, int variant, int sms, int split, int64_t* sizes) { sizes[0] = sizes[1] = 0; }
 
 API int wq8_gemm_select(int m, int n, int k, int hilo, int sms) {
@@ -1490,6 +1564,8 @@ template<class T> int dispatch_gemm(const int8_t* a, const int8_t* a_lo, const f
         case 1: return launch_gemm_wmma<T, 128, true, false>(a, a_lo, sa, b, sb, bias, residual, rscale, y, m, n, k, stream);
         case 7: return launch_gemm_wmma<T, 64, true, false>(a, a_lo, sa, b, sb, bias, residual, rscale, y, m, n, k, stream);
         case 10: case 11: return launch_gemm_wmma<T, 64, false, true>(a, a_lo, sa, b, sb, bias, residual, rscale, y, m, n, k, stream);
+        case 12: case 13: return launch_gemm_wmma<T, 64, false, true, true>(a, a_lo, sa, b, sb, bias, residual, rscale, y, m, n, k, stream);
+        case 14: return launch_gemm_wmma<T, 64, true, false, true>(a, a_lo, sa, b, sb, bias, residual, rscale, y, m, n, k, stream);
     }
     return -3;
 }
@@ -1499,7 +1575,7 @@ API int wq8_gemm(const int8_t* a, const int8_t* a_lo, const float* sa, const int
                  const void* rscale, void* y, int m, int n, int k, int dtype, int variant, int sms, int split, int* workspace, int* counters,
                  cudaStream_t stream) {
     if (!m || !n) return 0;
-    if ((variant == 1 || variant == 7) != (a_lo != nullptr)) return -2;
+    if ((variant == 1 || variant == 7 || variant == 14 || variant == 114) != (a_lo != nullptr)) return -2;
     if (dtype == 0) return dispatch_gemm<__half>(a, a_lo, sa, b, sb, bias, residual, rscale, y, m, n, k, variant, sms, split, workspace, counters, stream);
     if (dtype == 1) return dispatch_gemm<__nv_bfloat16>(a, a_lo, sa, b, sb, bias, residual, rscale, y, m, n, k, variant, sms, split, workspace, counters, stream);
     return -1;
