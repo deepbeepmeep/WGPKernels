@@ -138,6 +138,21 @@ q, sa = fp8.quantize_blocks(x)                     # or quantize once for severa
 y = fp8.gemm(q, sa, fp8_weight, fp8_scale, bias)   # ...and run the GEMM on the E4M3 activations
 ```
 
+## Block-sparse attention (VSA)
+
+`wgpkernels.attn` runs WanGP's video sparse attention (VSA): every 64-token query tile attends only the key tiles of its index list,
+with INT8 Q / K (one scale per head and 64-row block) and partial key tiles masked by their real row count. It is derived from
+SpargeAttn / SageAttention 2 (Apache 2.0, vendored in `wgpkernels/attn/sparge` with its license): FP8 P·V with per-channel V scales on
+SM89+ and FP16 P·V on SM80-88. CUDA only (SM80+); WanGP uses its Triton path elsewhere.
+
+```python
+from wgpkernels import attn
+
+attn.load_library()
+kind = attn.kernel_kind(device)   # "fp8", "fp16" or None
+attn.vsa_attention(q_int8, k_int8, v, out, lut, count, valid, q_scale, k_scale, v_scale, sm_scale)
+```
+
 ## Building from source
 
 ### Activation and convolution library
@@ -198,6 +213,7 @@ the versions nvcc accepts) or gcc (Linux).
 python -m wgpkernels.build                       # every toolkit-supported SM75+ target into wgpkernels/int8/
 python -m wgpkernels.build --library ops         # SM80+ targets for activation/convolution kernels
 python -m wgpkernels.build --library fp8         # SM75+ targets for the FP8 kernels (--hip <ROCm SDK root> for RDNA4)
+python -m wgpkernels.build --library attn        # SM80+ targets for the VSA attention kernels (CUDA only)
 python -m wgpkernels.build --arch 120 --verbose  # one architecture, with register and spill report
 python -m wgpkernels.build --hip <ROCm SDK root> # AMD gfx1200 and gfx1201 with ROCm 10's hipcc
 pip install -e .                                 # editable install using the library built in place

@@ -13,12 +13,12 @@ from pathlib import Path
 
 PACKAGE = Path(__file__).resolve().parent
 # SASS for every listed architecture plus PTX for the newest, so later GPUs JIT once. Turing (sm_75) runs the INT8 kernels with synchronous copies and m8n8k16 MMAs,
-# and the FP8 kernels on E4M3 decoded to FP16 (E4M3 tensor cores from sm_89); the activation / convolution library needs SM80.
+# and the FP8 kernels on E4M3 decoded to FP16 (E4M3 tensor cores from sm_89); the activation / convolution and VSA attention libraries need SM80.
 DEFAULT_ARCHS = "all"
-MIN_ARCH = {"int8": 75, "ops": 80, "fp8": 75}
+MIN_ARCH = {"int8": 75, "ops": 80, "attn": 80, "fp8": 75}
 DEFAULT_HIP_ARCHS = "gfx1200,gfx1201"  # RDNA4: the AMD targets need rocWMMA's gfx12 WMMA
 # library name -> CUDA source, relative to the package
-LIBRARIES = {"int8": "int8/int8_gemm.cu", "ops": "ops/ops.cu", "fp8": "fp8/fp8_gemm.cu"}
+LIBRARIES = {"int8": "int8/int8_gemm.cu", "ops": "ops/ops.cu", "attn": "attn/attn.cu", "fp8": "fp8/fp8_gemm.cu"}
 
 
 def library_file(name):
@@ -71,6 +71,8 @@ def build_hip(name="int8", archs=DEFAULT_HIP_ARCHS, output=None, rocm=None, verb
     """HIP build with the ROCm SDK's hipcc (one --offload-arch per GPU); the library links the HIP runtime that ROCm PyTorch loads."""
     if name == "ops":
         raise ValueError("The ops library uses NVIDIA WMMA; use the independent Triton/PyTorch operations on HIP")
+    if name == "attn":
+        raise ValueError("The VSA attention library is CUDA-only (SageAttention-derived PTX); WanGP falls back to its Triton path on HIP")
     rocm = Path(rocm)
     target = Path(output or library_file(name)).resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -94,7 +96,7 @@ def build_hip(name="int8", archs=DEFAULT_HIP_ARCHS, output=None, rocm=None, verb
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--library", default="int8", choices=sorted(LIBRARIES))
-    parser.add_argument("--arch", default=None, help="all supported targets (default: SM75+ for int8, SM80+ for ops), comma separated SM versions (CUDA), or gfx targets (HIP)")
+    parser.add_argument("--arch", default=None, help="all supported targets (default: SM75+ for int8 / fp8, SM80+ for ops / attn), comma separated SM versions (CUDA), or gfx targets (HIP)")
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--nvcc", default="nvcc")
     parser.add_argument("--hip", default=None, help="ROCm SDK root: build for AMD GPUs with its hipcc")
