@@ -4,6 +4,11 @@
 // product starts from zero in FP32 and is promoted (scaled and added) into FP32 accumulators. A: (M, K) E4M3 activations with FP32
 // scales per row and block (amax / 448); B: the checkpoint's (N, K) E4M3 weights with FP32 scales per 128 x 128 block or per output
 // channel and block (folded with the activation scales), or per output channel or tensor (applied in the epilogue). These are approximate (W8A8) kernels: the activation quantization dominates the error.
+// The W8A16 path (MATH_A16) multiplies
+// 16-bit activations instead: FP16 rows (BF16 rows written as FP16 with one power-of-two scale per row and 128-element block by
+// prepare_rows_a16, exact for values within 2^28 of their block's maximum) times the E4M3 weights decoded exactly to FP16 in registers,
+// FP16 MMAs with FP32 accumulation on every architecture: more precise than the dequantization (whose weights are rounded to the
+// compute dtype) with no copy of the weights and no quantization of the activations.
 // Tensor cores: E4M3 MMAs on SM89+ (RTX 40/50); on SM80-88 and SM75 the E4M3 bytes are decoded exactly to FP16 in registers (FP16
 // MMAs with FP32 accumulation: the same products, another summation order); AMD RDNA4: rocWMMA's gfx12 FP8 WMMA.
 #if defined(__HIP__)
@@ -161,6 +166,38 @@ __global__ void __launch_bounds__(256) quantize_tiles_f8(const T* __restrict__ x
     }
 }
 
+// FP16 rows of 16-bit x with one power-of-two scale per row and 128-element block, the block's maximum scaled into [2^14, 2^15): exact
+// for BF16 values within 2^28 of their block's maximum (the scaling is exact and FP16 holds BF16's 8-bit mantissa), the scale folded
+// into the W8A16 GEMM's promotion. A warp per row and block: lane l holds elements 4l..4l+3 (K a multiple of 16).
+template<class T>
+__global__ void __launch_bounds__(256) prepare_rows_a16(const T* __restrict__ x, __half* __restrict__ q, float* __restrict__ scale, int m, int k,
+                                                        int64_t ldx, int kblocks) {
+    const int lane = threadIdx.x & 31;
+    const int64_t item = int64_t(blockIdx.x) * 8 + (threadIdx.x >> 5);
+    const int row = int(item / kblocks), kb = int(item % kblocks);
+    if (row >= m) return;  // warp-uniform
+    const int col = kb * 128 + lane * 4;
+    const bool valid = col < k;
+    float v[4];
+    {
+        const uint2 raw = valid ? *reinterpret_cast<const uint2*>(x + int64_t(row) * ldx + col) : make_uint2(0, 0);
+        const T* e = reinterpret_cast<const T*>(&raw);
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) v[j] = to_float(e[j]);
+    }
+    float amax = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
+    #pragma unroll
+    for (int d = 16; d; d >>= 1) amax = fmaxf(amax, shfl_xor(amax, d));
+    const uint32_t exponent = (__float_as_uint(amax) >> 23) & 0xFFu;  // biased exponent of the block maximum
+    const float s = amax > 0.f ? __uint_as_float((exponent > 15u ? exponent - 14u : 1u) << 23) : 1.f;  // 2^(floor(log2 amax) - 14); 1 for zeros
+    if (!lane) scale[int64_t(row) * kblocks + kb] = s;
+    if (valid) {
+        const float inv = 1.f / s;
+        __half2 h0 = __floats2half2_rn(v[0] * inv, v[1] * inv), h1 = __floats2half2_rn(v[2] * inv, v[3] * inv);
+        *reinterpret_cast<uint2*>(q + int64_t(row) * k + col) = make_uint2(*reinterpret_cast<uint32_t*>(&h0), *reinterpret_cast<uint32_t*>(&h1));
+    }
+}
+
 // Weight scale granularity: per 128 x 128 block or per output channel and 128-element block of K (both folded with the activation scales
 // every block), per output channel or per tensor (epilogue).
 enum { WS_BLOCK = 0, WS_CHANNEL = 1, WS_TENSOR = 2, WS_GROUP = 3 };
@@ -210,6 +247,15 @@ template<int N> DEVICE void cp_async_wait() {}
 DEVICE void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
 template<int N> DEVICE void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" :: "n"(N > 0 ? N : 0)); }  // Turing's 2-stage tiles: never run here
 #endif
+
+DEVICE void lds64(uint32_t& lo, uint32_t& hi, uint32_t addr) {
+    asm volatile("ld.shared.v2.u32 {%0,%1}, [%2];\n" : "=r"(lo), "=r"(hi) : "r"(addr));
+}
+template<int SEL> DEVICE uint32_t prmt(uint32_t a, uint32_t b) {
+    uint32_t r;
+    asm("prmt.b32 %0, %1, %2, %3;\n" : "=r"(r) : "r"(a), "r"(b), "n"(SEL));
+    return r;
+}
 
 DEVICE void ldmatrix_x4(uint32_t* r, uint32_t addr) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
@@ -261,16 +307,21 @@ DEVICE void mma_f16(float* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3
 // bytes of lane t hold k 4t..4t+3 and 4t+16..4t+19 for both A and B: the first MMA takes the k 0-15 registers, the even bytes as its
 // logical k (2t, 2t+1) and the odd ones as (2t+8, 2t+9), the second MMA the k 16-31 registers. A and B use the same assignment, so every
 // product of the block is summed once.
+// MATH_A16: A holds FP16 activations (two bytes per element; sa the power-of-two scales of prepare_rows_a16, or null for 1); B is decoded
+// as in MATH_F16, so the A fragments take B's k assignment: lane t loads its four consecutive k (4t..4t+3) of each row as two words and
+// permutes them into the even pair (k 4t, 4t+2: logical 2t, 2t+1) and the odd pair (k 4t+1, 4t+3: logical 2t+8, 2t+9).
 // ---------------------------------------------------------------------------------------------------------------------
-enum { MATH_E4M3 = 0, MATH_F16 = 1 };
+enum { MATH_E4M3 = 0, MATH_F16 = 1, MATH_A16 = 2 };
 
-template<int BM, int BN, int BK, int WM, int WN, int STAGES>
+template<int BM, int BN, int BK, int WM, int WN, int STAGES, bool A16 = false>
 struct GemmConfig {
     static constexpr int WARPS_M = BM / WM, WARPS_N = BN / WN, THREADS = 32 * WARPS_M * WARPS_N;
     static constexpr int MI = WM / 16, NI = WN / 8, CHUNKS = BK / 16, KSTEPS = BK / 32;
-    static constexpr int A_BYTES = BM * BK, B_BYTES = BN * BK, STAGE_BYTES = A_BYTES + B_BYTES;
+    static constexpr int A_ELEM = A16 ? 2 : 1;  // bytes per activation element
+    static constexpr int A_BYTES = BM * BK * A_ELEM, B_BYTES = BN * BK, STAGE_BYTES = A_BYTES + B_BYTES;
     static constexpr int SMEM = STAGES * STAGE_BYTES;
-    static constexpr int ROW_STEP = THREADS / CHUNKS, A_PER = BM / ROW_STEP, B_PER = BN / ROW_STEP;
+    static constexpr int ROW_STEP = THREADS / CHUNKS, B_PER = BN / ROW_STEP;
+    static constexpr int A_CHUNKS = CHUNKS * A_ELEM, A_ROW_STEP = THREADS / A_CHUNKS, A_PER = BM / A_ROW_STEP;  // 16-byte chunks of an A row
     static constexpr int KPB = 128 / BK;  // k-tiles per scale block
     // Ring of block scales: the slot of block b is refilled for block b + RING by the stage issued STAGES - 1 k-tiles ahead, which
     // must come after the last k-tile of block b (whose fold reads the slot).
@@ -292,6 +343,12 @@ template<int CHUNKS> DEVICE int swizzle(int r, int c) {
     if (CHUNKS == 4) return r * 64 + ((c ^ ((r >> 1) & 3)) << 4);
     return r * (CHUNKS * 16) + ((c ^ (r & 7)) << 4);
 }
+// FP16 activation tiles (MATH_A16): the fragments are 8-byte loads, one half-warp (4 rows x 32 contiguous bytes) per phase, so the 32-byte
+// chunk pairs of 4 consecutive rows go to distinct bank groups.
+template<int CHUNKS, bool A16> DEVICE int swizzle_a(int r, int c) {
+    if (A16) return r * (CHUNKS * 16) + ((c ^ ((r & 3) << 1)) << 4);
+    return swizzle<CHUNKS>(r, c);
+}
 
 DEVICE int sk_cta_of(long long unit, const Schedule& s) { return int(((unit + 1) * s.sk_ctas - 1) / s.sk_units); }
 
@@ -299,10 +356,11 @@ template<class T, int BM, int BN, int BK, int WM, int WN, int STAGES, int MATH>
 DEVICE void gemm_f8_body(const uint8_t* __restrict__ a, const float* __restrict__ sa, const uint8_t* __restrict__ b, const float* __restrict__ sb,
                          int wmode, const T* __restrict__ bias, const T* residual, const T* __restrict__ rscale, T* y, int m, int n, int k,
                          const Schedule& sched, float* __restrict__ workspace, int* __restrict__ counters) {
-    using C = GemmConfig<BM, BN, BK, WM, WN, STAGES>;
+    using C = GemmConfig<BM, BN, BK, WM, WN, STAGES, MATH == MATH_A16>;
     constexpr int MI = C::MI, NI = C::NI, KPB = C::KPB;
-    // FP16 emulation: the decoded bytes are the E4M3 values times 2^-8, their products times 2^-16.
-    constexpr float UNIT = MATH == MATH_F16 ? 65536.f : 1.f;
+    constexpr bool A16 = MATH == MATH_A16;
+    // FP16 emulation: the decoded bytes are the E4M3 values times 2^-8, their products times 2^-16 (times 2^-8 with 16-bit activations).
+    constexpr float UNIT = MATH == MATH_F16 ? 65536.f : A16 ? 256.f : 1.f;
     extern __shared__ __align__(128) uint8_t smem[];
     // The block's activation scales of the tile's BM rows, then its weight scales of the tile's columns, come with the stage of the block's
     // first k-tile (cp.async: no registers held while in flight). With 128-element k-tiles (96 KiB of stages) this ring fills the 99 KiB
@@ -313,6 +371,7 @@ DEVICE void gemm_f8_body(const uint8_t* __restrict__ a, const float* __restrict_
     const int warp_m = warp / C::WARPS_N, warp_n = warp % C::WARPS_N;
     const uint32_t base = smem_u32(smem);
     const int chunk = tid % C::CHUNKS, row0 = tid / C::CHUNKS;
+    const int a_chunk = tid % C::A_CHUNKS, a_row0 = tid / C::A_CHUNKS;
     const int g = lane >> 2, t4 = lane & 3;
     const int kblocks = (k + 127) / 128, nblocks = (n + 127) / 128;
 
@@ -361,9 +420,9 @@ DEVICE void gemm_f8_body(const uint8_t* __restrict__ a, const float* __restrict_
         work_kb = w.kb;
         #pragma unroll
         for (int i = 0; i < C::A_PER; ++i) {
-            const int r = w.m0 + row0 + i * C::ROW_STEP;
+            const int r = w.m0 + a_row0 + i * C::A_ROW_STEP;
             a_ok[i] = r < m;
-            a_src[i] = a + (a_ok[i] ? int64_t(r) * k + chunk * 16 : 0);
+            a_src[i] = a + (a_ok[i] ? int64_t(r) * k * C::A_ELEM + a_chunk * 16 : 0);
         }
         #pragma unroll
         for (int i = 0; i < C::B_PER; ++i) {
@@ -379,7 +438,8 @@ DEVICE void gemm_f8_body(const uint8_t* __restrict__ a, const float* __restrict_
             float* ring = block_scales[kb % C::RING];
             if (tid < BM) {
                 const int row = work_m0 + tid;
-                cp_async4(smem_u32(ring + tid), row < m ? sa + int64_t(row) * kblocks + kb : sa, row < m);
+                if (A16 && !sa) asm volatile("st.shared.f32 [%0], %1;\n" :: "r"(smem_u32(ring + tid)), "f"(1.f));  // unscaled FP16 activations
+                else cp_async4(smem_u32(ring + tid), row < m ? sa + int64_t(row) * kblocks + kb : sa, row < m);
             } else if (wmode == WS_BLOCK && tid < BM + C::WBLOCKS) {
                 const int nb = work_n0 / 128 + (tid - BM);
                 cp_async4(smem_u32(ring + tid), nb < nblocks ? sb + int64_t(nb) * kblocks + kb : sb, nb < nblocks);
@@ -391,12 +451,12 @@ DEVICE void gemm_f8_body(const uint8_t* __restrict__ a, const float* __restrict_
     };
     auto load_stage = [&](int slot, int kt) {
         const int k0 = kt * BK;
-        const bool k_ok = k0 + chunk * 16 < k;
+        const bool k_ok = k0 + chunk * 16 < k, a_k_ok = k0 + a_chunk * (16 / C::A_ELEM) < k;
         const uint32_t sa_base = base + slot * C::STAGE_BYTES, sb_base = sa_base + C::A_BYTES;
         #pragma unroll
         for (int i = 0; i < C::A_PER; ++i) {
-            const bool ok = a_ok[i] && k_ok;
-            cp_async16(sa_base + swizzle<C::CHUNKS>(row0 + i * C::ROW_STEP, chunk), ok ? a_src[i] + k0 : a, ok);
+            const bool ok = a_ok[i] && a_k_ok;
+            cp_async16(sa_base + swizzle_a<C::A_CHUNKS, A16>(a_row0 + i * C::A_ROW_STEP, a_chunk), ok ? a_src[i] + k0 * C::A_ELEM : a, ok);
         }
         #pragma unroll
         for (int i = 0; i < C::B_PER; ++i) {
@@ -411,10 +471,10 @@ DEVICE void gemm_f8_body(const uint8_t* __restrict__ a, const float* __restrict_
     uint4 staged_a[C::A_PER], staged_b[C::B_PER];
     auto fetch_stage = [&](int kt) {
         const int k0 = kt * BK;
-        const bool k_ok = k0 + chunk * 16 < k;
+        const bool k_ok = k0 + chunk * 16 < k, a_k_ok = k0 + a_chunk * (16 / C::A_ELEM) < k;
         #pragma unroll
         for (int i = 0; i < C::A_PER; ++i)
-            staged_a[i] = a_ok[i] && k_ok ? __ldcg(reinterpret_cast<const uint4*>(a_src[i] + k0)) : make_uint4(0, 0, 0, 0);
+            staged_a[i] = a_ok[i] && a_k_ok ? __ldcg(reinterpret_cast<const uint4*>(a_src[i] + k0 * C::A_ELEM)) : make_uint4(0, 0, 0, 0);
         #pragma unroll
         for (int i = 0; i < C::B_PER; ++i)
             staged_b[i] = b_ok[i] && k_ok ? __ldcg(reinterpret_cast<const uint4*>(b_src[i] + k0)) : make_uint4(0, 0, 0, 0);
@@ -423,7 +483,7 @@ DEVICE void gemm_f8_body(const uint8_t* __restrict__ a, const float* __restrict_
         const uint32_t sa_base = base + slot * C::STAGE_BYTES, sb_base = sa_base + C::A_BYTES;
         #pragma unroll
         for (int i = 0; i < C::A_PER; ++i)
-            asm volatile("st.shared.v4.u32 [%0], {%1,%2,%3,%4};\n" :: "r"(sa_base + swizzle<C::CHUNKS>(row0 + i * C::ROW_STEP, chunk)),
+            asm volatile("st.shared.v4.u32 [%0], {%1,%2,%3,%4};\n" :: "r"(sa_base + swizzle_a<C::A_CHUNKS, A16>(a_row0 + i * C::A_ROW_STEP, a_chunk)),
                          "r"(staged_a[i].x), "r"(staged_a[i].y), "r"(staged_a[i].z), "r"(staged_a[i].w));
         #pragma unroll
         for (int i = 0; i < C::B_PER; ++i)
@@ -443,6 +503,7 @@ DEVICE void gemm_f8_body(const uint8_t* __restrict__ a, const float* __restrict_
     };
 
     uint32_t af[2][MI][4], bf[2][NI][2];
+    uint32_t af16[2][MI][2][4];  // MATH_A16: the FP16 A fragments of the two k16 halves of a k32 step
     // ldmatrix offsets: the swizzle's XOR term is the same for rows 16 apart, so the fragments of a k-step are one per-thread offset
     // plus constants (16 rows = 16 * CHUNKS * 16 bytes).
     uint32_t a_frag[C::KSTEPS], b_frag[C::KSTEPS];
@@ -454,8 +515,24 @@ DEVICE void gemm_f8_body(const uint8_t* __restrict__ a, const float* __restrict_
     constexpr int ROWS16 = 16 * C::CHUNKS * 16;
     auto load_frags = [&](int buf, int slot, int ks) {
         const uint32_t sa_base = base + slot * C::STAGE_BYTES + a_frag[ks], sb_base = base + slot * C::STAGE_BYTES + C::A_BYTES + b_frag[ks];
-        #pragma unroll
-        for (int mi = 0; mi < MI; ++mi) ldmatrix_x4(af[buf][mi], sa_base + mi * ROWS16);
+        if constexpr (A16) {
+            const uint32_t a_base = base + slot * C::STAGE_BYTES;
+            #pragma unroll
+            for (int mi = 0; mi < MI; ++mi)
+                #pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    // k16 half h of the k32 step: lane t4 reads k 16h + 4t4 .. +3 (8 bytes) of rows g and g + 8
+                    const int row = warp_m * WM + mi * 16 + g, c = ks * 4 + h * 2 + (t4 >> 1), off = (t4 & 1) * 8;
+                    uint32_t w0, w1, w2, w3;
+                    lds64(w0, w1, a_base + swizzle_a<C::A_CHUNKS, true>(row, c) + off);
+                    lds64(w2, w3, a_base + swizzle_a<C::A_CHUNKS, true>(row + 8, c) + off);
+                    af16[buf][mi][h][0] = prmt<0x5410>(w0, w1); af16[buf][mi][h][1] = prmt<0x5410>(w2, w3);  // even k: logical 2t4, 2t4 + 1
+                    af16[buf][mi][h][2] = prmt<0x7632>(w0, w1); af16[buf][mi][h][3] = prmt<0x7632>(w2, w3);  // odd k: logical 2t4 + 8, 2t4 + 9
+                }
+        } else {
+            #pragma unroll
+            for (int mi = 0; mi < MI; ++mi) ldmatrix_x4(af[buf][mi], sa_base + mi * ROWS16);
+        }
         #pragma unroll
         for (int ni = 0; ni < NI; ni += 2) {
             uint32_t t[4];
@@ -477,15 +554,28 @@ DEVICE void gemm_f8_body(const uint8_t* __restrict__ a, const float* __restrict_
                 bh[ni][0] = e4m3_even(bf[buf][ni][0]); bh[ni][1] = e4m3_odd(bf[buf][ni][0]);
                 bh[ni][2] = e4m3_even(bf[buf][ni][1]); bh[ni][3] = e4m3_odd(bf[buf][ni][1]);
             }
-            #pragma unroll
-            for (int mi = 0; mi < MI; ++mi) {
-                const uint32_t* q = af[buf][mi];  // rows g / g + 8 of k 0-15, then of k 16-31
-                const uint32_t lo[4] = {e4m3_even(q[0]), e4m3_even(q[1]), e4m3_odd(q[0]), e4m3_odd(q[1])};
-                const uint32_t hi[4] = {e4m3_even(q[2]), e4m3_even(q[3]), e4m3_odd(q[2]), e4m3_odd(q[3])};
+            if constexpr (A16) {
                 #pragma unroll
-                for (int ni = 0; ni < NI; ++ni) {
-                    mma_f16(acc[mi][ni], lo[0], lo[1], lo[2], lo[3], bh[ni][0], bh[ni][1]);
-                    mma_f16(acc[mi][ni], hi[0], hi[1], hi[2], hi[3], bh[ni][2], bh[ni][3]);
+                for (int mi = 0; mi < MI; ++mi) {
+                    const uint32_t* lo = af16[buf][mi][0];
+                    const uint32_t* hi = af16[buf][mi][1];
+                    #pragma unroll
+                    for (int ni = 0; ni < NI; ++ni) {
+                        mma_f16(acc[mi][ni], lo[0], lo[1], lo[2], lo[3], bh[ni][0], bh[ni][1]);
+                        mma_f16(acc[mi][ni], hi[0], hi[1], hi[2], hi[3], bh[ni][2], bh[ni][3]);
+                    }
+                }
+            } else {
+                #pragma unroll
+                for (int mi = 0; mi < MI; ++mi) {
+                    const uint32_t* q = af[buf][mi];  // rows g / g + 8 of k 0-15, then of k 16-31
+                    const uint32_t lo[4] = {e4m3_even(q[0]), e4m3_even(q[1]), e4m3_odd(q[0]), e4m3_odd(q[1])};
+                    const uint32_t hi[4] = {e4m3_even(q[2]), e4m3_even(q[3]), e4m3_odd(q[2]), e4m3_odd(q[3])};
+                    #pragma unroll
+                    for (int ni = 0; ni < NI; ++ni) {
+                        mma_f16(acc[mi][ni], lo[0], lo[1], lo[2], lo[3], bh[ni][0], bh[ni][1]);
+                        mma_f16(acc[mi][ni], hi[0], hi[1], hi[2], hi[3], bh[ni][2], bh[ni][3]);
+                    }
                 }
             }
         }
@@ -705,9 +795,9 @@ __global__ void __launch_bounds__(GemmConfig<BM, BN, BK, WM, WN, STAGES>::THREAD
 gemm_f8(const uint8_t* __restrict__ a, const float* __restrict__ sa, const uint8_t* __restrict__ b, const float* __restrict__ sb, int wmode,
         const T* __restrict__ bias, const T* residual, const T* __restrict__ rscale, T* y, int m, int n, int k, Schedule sched,
         float* __restrict__ workspace, int* __restrict__ counters) {
-    // Each architecture's code holds one math: E4M3 MMAs from SM89, the FP16 emulation below (the host launches the math of the code the
-    // driver loaded for the device).
-    if constexpr ((MATH == MATH_E4M3) != bool(WGP_FP8_MMA)) __trap();
+    // Each architecture's code holds one E4M3 math: E4M3 MMAs from SM89, the FP16 emulation below (the host launches the math of the code
+    // the driver loaded for the device); the W8A16 math runs everywhere.
+    if constexpr (MATH != MATH_A16 && (MATH == MATH_E4M3) != bool(WGP_FP8_MMA)) __trap();
     else gemm_f8_body<T, BM, BN, BK, WM, WN, STAGES, MATH>(a, sa, b, sb, wmode, bias, residual, rscale, y, m, n, k, sched, workspace, counters);
 }
 
@@ -899,6 +989,35 @@ int launch_gemm_wmma(const uint8_t* a, const float* sa, const uint8_t* b, const 
 #endif
 
 API int wf8_abi() { return 1; }
+// Optional features of this build (bit 0: the W8A16 path, prepare_a16 and variants 20 / 21), so that a newer Python layer can tell an
+// older library apart without an ABI change for current callers.
+API int wf8_features() {
+#if WGP_AMD
+    return 0;
+#else
+    return 1;
+#endif
+}
+
+template<class T> int launch_prepare_a16(const void* x, __half* q, float* scale, int m, int k, int64_t ldx, cudaStream_t stream) {
+    const int kblocks = (k + 127) / 128;
+    prepare_rows_a16<T><<<unsigned((int64_t(m) * kblocks + 7) / 8), 256, 0, stream>>>(static_cast<const T*>(x), q, scale, m, k, ldx, kblocks);
+    return int(cudaGetLastError());
+}
+
+// FP16 activations q (M, K) and FP32 power-of-two scales (M, ceil(K / 128)) of 16-bit x (dtype 0 = FP16, 1 = BF16; K a multiple of 16,
+// rows 8-byte aligned, ldx in elements) for the W8A16 GEMM: x = q * scale per row and 128-element block.
+API int wf8_prepare_a16(const void* x, void* q, float* scale, int m, int k, int64_t ldx, int dtype, cudaStream_t stream) {
+#if WGP_AMD
+    return -3;
+#else
+    if (!m) return 0;
+    if (k % 16) return -2;
+    if (dtype == 0) return launch_prepare_a16<__half>(x, static_cast<__half*>(q), scale, m, k, ldx, stream);
+    if (dtype == 1) return launch_prepare_a16<__nv_bfloat16>(x, static_cast<__half*>(q), scale, m, k, ldx, stream);
+    return -1;
+#endif
+}
 
 template<class T> int launch_quantize(const void* x, uint8_t* q, float* scale, int m, int k, int64_t ldx, int tile, cudaStream_t stream) {
     auto src = static_cast<const T*>(x);
@@ -938,6 +1057,12 @@ template<> struct Variant<11> : Derived<1, MATH_F16, 4> {};
 template<> struct Variant<12> : Derived<2, MATH_F16, 3> {};
 template<> struct Variant<110> : Derived<0, MATH_F16, 3> {};
 template<> struct Variant<111> : Derived<1, MATH_F16, 3> {};
+// 20 and 21: the 128x128 and 64x128 tiles with 16-bit activations (W8A16, every architecture: 72 / 64 KiB with 3 / 4 stages), 120 and
+// 121 their Turing versions (2 / 3 stages, 48 KiB).
+template<> struct Variant<20> : Derived<0, MATH_A16, 3> {};
+template<> struct Variant<21> : Derived<1, MATH_A16, 4> {};
+template<> struct Variant<120> : Derived<0, MATH_A16, 2> {};
+template<> struct Variant<121> : Derived<1, MATH_A16, 3> {};
 
 // Virtual architecture (major * 10 + minor) of the code the driver loaded for the current device, cached per device: the device's SASS,
 // or the PTX it compiled for a newer GPU (or for this one, from a library built for older architectures only).
@@ -957,6 +1082,7 @@ static int code_arch() {
 // A library built for older architectures only (--arch 86, --arch 75) runs their kernels on any newer GPU (the emulated paths' tests).
 static int device_variant(int variant) {
     const int arch = code_arch(), tile = variant % 10;
+    if (variant == 20 + tile || variant == 120 + tile) return tile > 1 ? -1 : arch >= 80 ? 20 + tile : 120 + tile;  // W8A16
     if (tile > 2 || (variant != tile && variant != 10 + tile && variant != 110 + tile)) return -1;
     return arch >= 89 ? tile : arch >= 80 ? 10 + tile : 110 + tile % 2;  // Turing: 64-element k-tiles
 }
@@ -1002,6 +1128,10 @@ API void wf8_gemm_workspace(int m, int n, int k, int variant, int sms, int split
         case 12: return workspace_sizes<12>(m, n, k, sms, split, sizes);
         case 110: return workspace_sizes<110>(m, n, k, sms, split, sizes);
         case 111: return workspace_sizes<111>(m, n, k, sms, split, sizes);
+        case 20: return workspace_sizes<20>(m, n, k, sms, split, sizes);
+        case 21: return workspace_sizes<21>(m, n, k, sms, split, sizes);
+        case 120: return workspace_sizes<120>(m, n, k, sms, split, sizes);
+        case 121: return workspace_sizes<121>(m, n, k, sms, split, sizes);
     }
     sizes[0] = sizes[1] = 0;
 }
@@ -1010,7 +1140,7 @@ template<class T, int VI>
 int launch_gemm(const uint8_t* a, const float* sa, const uint8_t* b, const float* sb, int wmode, const void* bias, const void* residual,
                 const void* rscale, void* y, int m, int n, int k, int sms, int split, float* workspace, int* counters, cudaStream_t stream) {
     using V = Variant<VI>;
-    using C = GemmConfig<V::BM, V::BN, V::BK, V::WM, V::WN, V::STAGES>;
+    using C = GemmConfig<V::BM, V::BN, V::BK, V::WM, V::WN, V::STAGES, V::MATH == MATH_A16>;
     auto kernel = gemm_f8<T, V::BM, V::BN, V::BK, V::WM, V::WN, V::STAGES, V::CTAS, V::MATH>;
     static bool configured = false;
     if (!configured) {
@@ -1036,6 +1166,8 @@ template<int VI> double estimate(int m, int n, int k, int sms, double efficiency
 }
 
 API int wf8_gemm_select(int m, int n, int k, int sms) { return estimate<2>(m, n, k, sms, 1.0) <= estimate<1>(m, n, k, sms, 0.8) ? 2 : 1; }
+// W8A16 tile choice when untuned: the 128x128 tile unless the 64x128 one keeps more SMs busy.
+API int wf8_gemm_select_a16(int m, int n, int k, int sms) { return estimate<20>(m, n, k, sms, 1.0) <= estimate<21>(m, n, k, sms, 0.8) ? 20 : 21; }
 
 template<class T> int dispatch_gemm(const uint8_t* a, const float* sa, const uint8_t* b, const float* sb, int wmode, const void* bias,
                                     const void* residual, const void* rscale, void* y, int m, int n, int k, int variant, int sms, int split,
@@ -1049,6 +1181,10 @@ template<class T> int dispatch_gemm(const uint8_t* a, const float* sa, const uin
         case 12: return launch_gemm<T, 12>(a, sa, b, sb, wmode, bias, residual, rscale, y, m, n, k, sms, split, workspace, counters, stream);
         case 110: return launch_gemm<T, 110>(a, sa, b, sb, wmode, bias, residual, rscale, y, m, n, k, sms, split, workspace, counters, stream);
         case 111: return launch_gemm<T, 111>(a, sa, b, sb, wmode, bias, residual, rscale, y, m, n, k, sms, split, workspace, counters, stream);
+        case 20: return launch_gemm<T, 20>(a, sa, b, sb, wmode, bias, residual, rscale, y, m, n, k, sms, split, workspace, counters, stream);
+        case 21: return launch_gemm<T, 21>(a, sa, b, sb, wmode, bias, residual, rscale, y, m, n, k, sms, split, workspace, counters, stream);
+        case 120: return launch_gemm<T, 120>(a, sa, b, sb, wmode, bias, residual, rscale, y, m, n, k, sms, split, workspace, counters, stream);
+        case 121: return launch_gemm<T, 121>(a, sa, b, sb, wmode, bias, residual, rscale, y, m, n, k, sms, split, workspace, counters, stream);
     }
     return -3;
 }
@@ -1057,8 +1193,9 @@ template<class T> int dispatch_gemm(const uint8_t* a, const float* sa, const uin
 // accumulators fit the 256 registers (the 128-row tile spills).
 API void wf8_gemm_workspace(int m, int n, int k, int variant, int sms, int split, int64_t* sizes) { sizes[0] = sizes[1] = 0; }
 API int wf8_gemm_select(int m, int n, int k, int sms) { return 1; }
-API int wf8_device_variant(int variant) { return variant % 10 <= 2 ? 1 : -1; }
+API int wf8_device_variant(int variant) { return variant % 10 <= 2 && variant < 20 ? 1 : variant >= 110 && variant < 120 ? 1 : -1; }
 API int wf8_code_arch() { return 0; }
+API int wf8_gemm_select_a16(int m, int n, int k, int sms) { return -1; }
 
 template<class T> int dispatch_gemm(const uint8_t* a, const float* sa, const uint8_t* b, const float* sb, int wmode, const void* bias,
                                     const void* residual, const void* rscale, void* y, int m, int n, int k, int variant, int sms, int split,
@@ -1069,7 +1206,8 @@ template<class T> int dispatch_gemm(const uint8_t* a, const float* sa, const uin
 #endif
 
 // Y (M, N) = sum over blocks of (A * sa) @ (B * sb).T + bias, or with a residual R (M, N): Y = R + rscale * (... + bias) (rscale: N values
-// or null for 1), computed in FP32 and rounded once; Y may be R. A (M, K) and B (N, K) E4M3, sa (M, ceil(K / 128)) FP32; sb per wmode:
+// or null for 1), computed in FP32 and rounded once; Y may be R. A (M, K) and B (N, K) E4M3, sa (M, ceil(K / 128)) FP32 (W8A16 variants
+// 20 / 21: A (M, K) FP16 and sa its power-of-two block scales from wf8_prepare_a16, or null for unscaled rows); sb per wmode:
 // 0 = (ceil(N / 128), ceil(K / 128)) blocks, 1 = (N) channels, 2 = (1) tensor, 3 = (N, ceil(K / 128)) channels and blocks of K. K a
 // multiple of 16; A, B, R, Y contiguous. dtype of Y, bias, R, rscale: 0 = FP16, 1 = BF16. workspace / counters: wf8_gemm_workspace()
 // sizes; counters zeroed, and left zeroed.

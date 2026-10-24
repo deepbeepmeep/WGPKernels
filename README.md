@@ -125,6 +125,11 @@ E4M3 with one scale per token and 128-element block (`amax / 448`, as DeepGEMM's
 - Persistent tiles with stream-K; the results are deterministic. Bias and residual epilogue as for the INT8 kernels.
 - These are approximate kernels: FP8 activations give about 2.5e-2 relative error per layer (about 1e-2 when activations have outlier
   channels), against about 2.5e-3 for FP8 weights with BF16 activations.
+- `linear(..., precise=True)` keeps the activations 16-bit (W8A16): the E4M3 weights are decoded exactly to FP16 in registers and multiplied
+  with FP16 activations on the FP16 tensor cores (FP32 accumulation) on every NVIDIA architecture, BF16 activations first written as FP16
+  with one power-of-two scale per row and 128-element block (`prepare_a16()`, exact for values within 2^28 of their block's maximum).
+  No copy of the weights, no quantization of the activations: about 0.7x the error of the dequantization (whose weights are rounded to
+  the compute dtype), at about 1.15x the time of the E4M3 kernels on Turing. `a16_supported()` tells whether the loaded library has it.
 - RTX 4090, 8k-36k tokens at hidden size 4096 / MLP 12288: 296-312 TFLOPS for the GEMM, 1.60-1.76x the speed of a cuBLAS BF16 matmul
   including the activation quantization.
 

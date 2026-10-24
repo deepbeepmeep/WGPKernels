@@ -12,6 +12,11 @@ accumulated from zero in FP32 and promoted into FP32 accumulators. Kernels come 
   round to nearest even as PyTorch's .to(torch.float8_e4m3fn) and saturate to +/-448.
 - Tensor cores: E4M3 MMAs on SM89+ (RTX 40/50); on SM80-88 and Turing (SM75) the E4M3 bytes are decoded exactly to FP16 in registers
   (FP16 MMAs, FP32 accumulation: the same products, another summation order); AMD RDNA4: rocWMMA's gfx12 FP8 WMMA.
+- W8A16 (linear(precise=True), gemm(a16=True), every NVIDIA architecture): the activations stay 16-bit, FP16 rows (BF16 rows written as
+  FP16 by prepare_a16 with one power-of-two scale per row and 128-element block, exact for values within 2^28 of their block's maximum)
+  times the E4M3 weights decoded exactly to FP16 in registers, FP32 accumulation: no copy of the weights, no quantization of the
+  activations, more precise than the dequantization (whose weights are rounded to the compute dtype). Libraries built before this path
+  report a16_supported() False.
 - Persistent tiles with stream-K for the last wave; split tiles add their FP32 partial sums in a fixed order: results are deterministic.
 
 FP8 W8A8 is approximate: the activation quantization dominates the error (measured per layer: about 10x the error of the same FP8
@@ -34,6 +39,7 @@ WS_BLOCK, WS_CHANNEL, WS_TENSOR, WS_GROUP = 0, 1, 2, 3  # weight scale granulari
 _COUNTERS = 1024  # split tiles never exceed the SM count
 HIP_ARCHS = ("gfx1200", "gfx1201")  # the AMD targets of the HIP library (RDNA4)
 _lib = None
+_a16 = False  # the library has the W8A16 path (wf8_features bit 0)
 _DTYPES = {torch.float16: 0, torch.bfloat16: 1, torch.float32: 2}
 _FP8 = (torch.float8_e4m3fn, torch.uint8, torch.int8)  # E4M3 bytes, or their raw views
 _sms = {}
@@ -46,11 +52,16 @@ def default_library_path():
 
 
 def load_library(path=None):
-    global _lib
+    global _lib, _a16
     lib = ctypes.CDLL(str(Path(path or default_library_path()).resolve()))
     if lib.wf8_abi() != 1:
         raise RuntimeError("FP8 GEMM library ABI mismatch; rebuild it")
     p, i, i64 = ctypes.c_void_p, ctypes.c_int, ctypes.c_int64
+    features = getattr(lib, "wf8_features", None)
+    _a16 = bool(features and features() & 1)
+    if _a16:
+        lib.wf8_prepare_a16.argtypes = [p, p, p, i, i, i64, i, p]
+        lib.wf8_gemm_select_a16.argtypes = [i, i, i, i]
     lib.wf8_quantize.argtypes = [p, p, p, i, i, i64, i, i, p]
     lib.wf8_gemm.argtypes = [p, p, p, p, i, p, p, p, p, i, i, i, i, i, i, i, p, p, p]
     lib.wf8_gemm_workspace.argtypes = [i, i, i, i, i, i, p]
@@ -93,6 +104,21 @@ def _zeroed_counters(device, size):
     if size > _COUNTERS * 4:
         raise RuntimeError("FP8 GEMM split-K counters exceeded")
     return _counters[device.index]
+
+
+def a16_supported():
+    """Whether the loaded library computes 16-bit activations (W8A16)."""
+    return _a16
+
+
+def prepare_a16(x):
+    """(FP16 rows of 16-bit x (M, K), FP32 power-of-two scales (M, ceil(K / 128))): x = q * scale per row and 128-element block, exactly for
+    BF16 values within 2^28 of their block's maximum (rows 8-byte aligned, unit column stride, K a multiple of 16)."""
+    m, k = x.shape
+    q = torch.empty((m, k), dtype=torch.float16, device=x.device)
+    scale = torch.empty((m, (k + 127) // 128), dtype=torch.float32, device=x.device)
+    _check(_lib.wf8_prepare_a16(x.data_ptr(), q.data_ptr(), scale.data_ptr(), m, k, x.stride(0), _DTYPES[x.dtype], _stream(x.device)))
+    return q, scale
 
 
 def kernel_path():
@@ -156,7 +182,8 @@ def _scales(sb):
 
 # Tile configurations (variant, stream-K split) timed per shape bucket, kernel path and GPU; the first is the untuned default.
 _CANDIDATES = ((2, 1), (2, 0), (0, 1), (0, 0), (1, 0), (1, 1))
-_TUNING_VERSION = 1
+_CANDIDATES_A16 = ((20, 1), (20, 0), (21, 1), (21, 0))
+_TUNING_VERSION = 2
 _TUNING_PATH = Path.home() / ".triton" / "autotune" / "wgpkernels_fp8.json"
 _tuned = None
 
@@ -220,21 +247,21 @@ def _best_of(launches, device):
     return timings
 
 
-def _tuned_config(a, sa, b, sb, y):
+def _tuned_config(a, sa, b, sb, y, a16=False):
     """((variant, split), whether it is a tuned choice) of this shape bucket: cached, else timed now on this call's operands (y: an
     output the timing may overwrite), or the untuned default during CUDA graph capture or compilation."""
     (m, k), n = a.shape, b.shape[0]
-    key = f"block|{_rows_bucket(m)}x{n}x{k}|{kernel_path()}|{_device_name(b.device.index)}"
+    key = f"{'a16' if a16 else 'block'}|{_rows_bucket(m)}x{n}x{k}|{kernel_path()}|{_device_name(b.device.index)}"
     config = _cache().get(key)
     if config is not None:
         return tuple(config), True
     if torch.cuda.is_current_stream_capturing() or torch.compiler.is_compiling():
-        return (_lib.wf8_gemm_select(m, n, k, _sm_count(b.device)), 1), False
+        return ((_lib.wf8_gemm_select_a16 if a16 else _lib.wf8_gemm_select)(m, n, k, _sm_count(b.device)), 1), False
     started = time.time()
-    label = f"FP8 GEMM {m}x{n}x{k} ({kernel_path()})"
+    label = f"FP8 GEMM {m}x{n}x{k} ({kernel_path()}{', 16-bit activations' if a16 else ''})"
     print(f"[WGPKernels] Autotuning {label}...", flush=True)
-    candidates = _CANDIDATES if torch.version.hip is None else ((1, 0),)  # AMD: one tile, no stream-K
-    timings = _best_of({config: (lambda config: lambda: gemm(a, sa, b, sb, None, y.dtype, config[1], config[0], y))(config)
+    candidates = (_CANDIDATES_A16 if a16 else _CANDIDATES) if torch.version.hip is None else ((1, 0),)  # AMD: one tile, no stream-K
+    timings = _best_of({config: (lambda config: lambda: gemm(a, sa, b, sb, None, y.dtype, config[1], config[0], y, a16=a16))(config)
                         for config in candidates}, b.device)
     best_ms, best = min((ms, config) for config, ms in timings.items())
     _tuned[key] = list(best)
@@ -248,14 +275,14 @@ def _tuned_config(a, sa, b, sb, y):
 _plans = {}
 
 
-def _plan(a, sa, b, sb, y, scratch_output):
+def _plan(a, sa, b, sb, y, scratch_output, a16=False):
     (m, k), n = a.shape, b.shape[0]
-    shape = (m, n, k, b.device.index, id(_lib))
+    shape = (m, n, k, a16, b.device.index, id(_lib))
     plan = _plans.get(shape)
     if plan is not None:
         return plan
     # the timing writes its outputs: never into an output that is also the residual
-    (variant, split), tuned = _tuned_config(a, sa, b, sb, torch.empty_like(y) if scratch_output else y)
+    (variant, split), tuned = _tuned_config(a, sa, b, sb, torch.empty_like(y) if scratch_output else y, a16)
     _lib.wf8_gemm_workspace(m, n, k, variant, _sm_count(b.device), split, _sizes)
     plan = (variant, split, _sizes[0], _sizes[1])
     if tuned:
@@ -263,49 +290,58 @@ def _plan(a, sa, b, sb, y, scratch_output):
     return plan
 
 
-def gemm(a, sa, b, sb, bias=None, out_dtype=torch.bfloat16, split=None, variant=None, out=None, residual=None, residual_scale=None):
+def gemm(a, sa, b, sb, bias=None, out_dtype=torch.bfloat16, split=None, variant=None, out=None, residual=None, residual_scale=None, a16=False):
     """Y = sum over 128-element blocks of (A * sa) @ (B * sb).T + bias for E4M3 A (M, K) with scales sa (M, ceil(K / 128)) (from
     quantize_blocks()) and E4M3 B (N, K) with scales sb per 128 x 128 block (ceil(N / 128), ceil(K / 128)), per channel and block of K
-    (N, ceil(K / 128)), per channel (N) or per tensor (1).
+    (N, ceil(K / 128)), per channel (N) or per tensor (1). a16: A (M, K) is FP16 (contiguous) and sa its power-of-two block scales from
+    prepare_a16(), or None for unscaled rows (W8A16).
     K a multiple of 16. bias (N), residual (M, N) and residual_scale (N) in out_dtype (FP16 or BF16): Y = residual + residual_scale *
-    (A @ B.T + bias); out may be the residual. variant (0: 128x128 tiles, 1: 64x128, 2: 128x128 with 128-element k-tiles) and split
-    (stream-K) are tuned when omitted."""
+    (A @ B.T + bias); out may be the residual. variant (0: 128x128 tiles, 1: 64x128, 2: 128x128 with 128-element k-tiles; a16: 20 and 21
+    for the first two tiles) and split (stream-K) are tuned when omitted."""
     m, k = a.shape
     n = b.shape[0]
-    if a.dtype not in _FP8 or b.dtype not in _FP8 or b.shape[1] != k or sa.shape != (m, -(-k // 128)):
+    if a16:
+        if not _a16:
+            raise RuntimeError("This FP8 library predates the W8A16 path; rebuild it")
+        if a.dtype != torch.float16 or not a.is_contiguous() or b.dtype not in _FP8 or b.shape[1] != k or (sa is not None and sa.shape != (m, -(-k // 128))):
+            raise ValueError("FP8 W8A16 GEMM operands: FP16 A (M, K), FP32 scales (M, ceil(K / 128)) or None, E4M3 B (N, K)")
+    elif a.dtype not in _FP8 or b.dtype not in _FP8 or b.shape[1] != k or sa.shape != (m, -(-k // 128)):
         raise ValueError("FP8 GEMM operands: E4M3 A (M, K), FP32 scales (M, ceil(K / 128)), E4M3 B (N, K)")
     wmode = _scale_mode(sb, n, k)
     sb = _scales(sb)
     sms = _sm_count(a.device)
     y = torch.empty((m, n), dtype=out_dtype, device=a.device) if out is None else out
     if variant is None and split is None:
-        variant, split, slot_bytes, counter_bytes = _plan(a, sa, b, sb, y, residual is not None)
+        variant, split, slot_bytes, counter_bytes = _plan(a, sa, b, sb, y, residual is not None, a16)
     else:
-        variant = 2 if variant is None else variant
+        variant = (20 if a16 else 2) if variant is None else variant
         split = 1 if split is None else split
         _lib.wf8_gemm_workspace(m, n, k, variant, sms, split, _sizes)
         slot_bytes, counter_bytes = _sizes[0], _sizes[1]
     slots = torch.empty(slot_bytes, dtype=torch.uint8, device=a.device) if slot_bytes else None
     counters = _zeroed_counters(a.device, counter_bytes).data_ptr() if counter_bytes else None
-    _check(_lib.wf8_gemm(a.data_ptr(), sa.data_ptr(), b.data_ptr(), sb.data_ptr(), wmode, _ptr(bias), _ptr(residual), _ptr(residual_scale),
+    _check(_lib.wf8_gemm(a.data_ptr(), _ptr(sa), b.data_ptr(), sb.data_ptr(), wmode, _ptr(bias), _ptr(residual), _ptr(residual_scale),
                          y.data_ptr(), m, n, k, _DTYPES[out_dtype], variant, sms, split, _ptr(slots), counters, _stream(a.device)))
     return y
 
 
-def linear(x, weight, scale, bias=None, tile=False, residual=None, residual_scale=None, out=None):
+def linear(x, weight, scale, bias=None, tile=False, residual=None, residual_scale=None, out=None, precise=False):
     """Y = X @ (E4M3 weight * scale).T + bias for 2-D FP16/BF16 X (rows 16-byte aligned, unit column stride; K a multiple of 16), the
-    activation quantized by quantize_blocks(x, tile) in row chunks within SCRATCH_BYTES. scale: FP32 per 128 x 128 block (ceil(N / 128),
-    ceil(K / 128)), per channel and block of K (N, ceil(K / 128)), per channel (N) or per tensor. Residual: Y = residual + residual_scale *
-    (...) in X's dtype (contiguous; out may be the residual)."""
+    activation quantized by quantize_blocks(x, tile) in row chunks within SCRATCH_BYTES, or kept 16-bit with precise=True (W8A16: FP16 X
+    used as is, BF16 X written as FP16 with power-of-two block scales by prepare_a16 in row chunks). scale: FP32 per 128 x 128 block
+    (ceil(N / 128), ceil(K / 128)), per channel and block of K (N, ceil(K / 128)), per channel (N) or per tensor. Residual: Y = residual +
+    residual_scale * (...) in X's dtype (contiguous; out may be the residual)."""
     m, k = x.shape
     n = weight.shape[0]
     out = torch.empty((m, n), dtype=x.dtype, device=x.device) if out is None else out
-    rows = max(128, SCRATCH_BYTES // (k + 4 * -(-k // 128)) // 128 * 128)  # multiples of 128: whole activation tiles
+    if precise and x.dtype == torch.float16 and x.is_contiguous():
+        return gemm(x, None, weight, scale, bias, x.dtype, out=out, residual=residual, residual_scale=residual_scale, a16=True)
+    rows = max(128, SCRATCH_BYTES // ((2 if precise else 1) * k + 4 * -(-k // 128)) // 128 * 128)  # multiples of 128: whole activation tiles
     for start in range(0, m, rows):
         stop = min(start + rows, m)
-        q, sa = quantize_blocks(x[start:stop], tile)
+        q, sa = prepare_a16(x[start:stop]) if precise else quantize_blocks(x[start:stop], tile)
         gemm(q, sa, weight, scale, bias, x.dtype, out=out[start:stop], residual=None if residual is None else residual[start:stop],
-             residual_scale=residual_scale)
+             residual_scale=residual_scale, a16=precise)
         del q, sa
     return out
 
@@ -322,7 +358,7 @@ def dequantize(q, scale, dtype=torch.float32):
         return v * scale.repeat_interleave(128, dim=1)[:, :k]
     if scale.dim() == 2 and scale.shape == (-(-m // 128), -(-k // 128)):
         return v * scale.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)[:m, :k]
-    return v * scale.reshape(m, 1)
+    return v * scale.reshape(-1, 1)
 
 
 def reference(a, sa, b, sb, bias=None, residual=None, residual_scale=None):
@@ -356,12 +392,33 @@ def reference(a, sa, b, sb, bias=None, residual=None, residual_scale=None):
 
 def selftest(device=None):
     """Runs the quantizer and every tile configuration once on small inputs (no tuning): None when the results match an FP64 reference
-    of the same block semantics, else a reason."""
+    of the same block semantics, else a reason. The W8A16 path (when the library has it) is checked against the exact product."""
     device = torch.device("cuda", torch.cuda.current_device()) if device is None else torch.device(device)
     generator = torch.Generator(device=device).manual_seed(0)
     for dtype in (torch.bfloat16, torch.float16):
         x = torch.randn(200, 384, dtype=dtype, device=device, generator=generator)
         x[:, 5] *= 30  # an outlier channel
+        if _a16 and torch.version.hip is None:
+            x[7, 128:256] *= 1e-20  # a block far below the others: its own power-of-two scale
+            q16, sa16 = prepare_a16(x)
+            if not torch.equal((q16.float().view(200, 3, 128) * sa16[:, :, None]).to(dtype).view(200, 384), x):
+                return f"prepare_a16 mismatch ({dtype})"
+            w = torch.randn(160, 384, device=device, generator=generator).to(dtype)
+            wq, ws = quantize_weight(w)
+            bias = torch.randn(160, dtype=dtype, device=device, generator=generator)
+            channel = torch.rand(160, device=device, generator=generator) / 448
+            groups = torch.rand(160, 3, device=device, generator=generator) / 448
+            for variant in (20, 21):
+                for split in (0, 1):
+                    for sb in (ws, channel, channel[:1], groups):
+                        ref = x.double() @ dequantize(wq, sb, torch.float64).T + bias.double()
+                        for a, sa in ((q16, sa16), (x, None)) if dtype == torch.float16 else ((q16, sa16),):
+                            y = gemm(a, sa, wq, sb, bias, dtype, split, variant, a16=True)
+                            error = ((y.double() - ref).norm() / ref.norm()).item()
+                            if not error < (4e-3 if dtype == torch.bfloat16 else 6e-4):
+                                return f"FP8 W8A16 GEMM mismatch ({dtype}, tiles {variant}, split {split}, scales {tuple(sb.shape)}): relative error {error:.3g}"
+            x = x.clone()
+            x[7, 128:256] = 0
         q, sa = quantize_blocks(x)
         reference_q = (x.float().view(200, 3, 128) * (1.0 / (x.float().abs().view(200, 3, 128).amax(-1, keepdim=True).clamp(1e-4) / 448.0))).to(torch.float8_e4m3fn)
         if not torch.equal(q.view(torch.uint8), reference_q.view(200, 384).view(torch.uint8)):
