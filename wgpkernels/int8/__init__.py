@@ -49,7 +49,8 @@ _lib = None
 _weight_groups = False  # the library takes per-(n, k-block) weight scales (wq8_features bit 0)
 _DTYPES = {torch.float16: 0, torch.bfloat16: 1, torch.float32: 2}
 _sms = {}
-_counters = {}
+_counters = {}  # device index -> the split-K counters its streams share
+_stream_counters = {}  # raw stream handle -> the counters of a stream prepared to run beside the others (prepare_stream)
 _sizes = (ctypes.c_int64 * 2)()
 
 
@@ -112,12 +113,24 @@ def _sm_count(device):
     return count
 
 
-def _zeroed_counters(device, size):
-    """Split-K tile counters, allocated when the library loads (never inside CUDA graph capture) and left zeroed by the kernels.
-    Concurrent calls on several streams of one device would share them: use one stream per device."""
+def prepare_stream(stream):
+    """Gives a stream its own split-K counters, so that its GEMMs may run at the same time as those of the device's other streams (the
+    branches of one CUDA graph, for example): the streams not prepared share one set, and two GEMMs running together on it would count
+    each other's tiles. Call it outside CUDA graph capture, before the stream's first GEMM; allocated with the current stream's allocator,
+    zeroed, and synchronized once."""
+    if stream.cuda_stream not in _stream_counters:
+        counters = torch.zeros(_COUNTERS, dtype=torch.int32, device=stream.device)
+        torch.cuda.current_stream(stream.device).synchronize()  # zeroed before the stream or a graph captured on it reads them
+        _stream_counters[stream.cuda_stream] = counters
+
+
+def _zeroed_counters(device, size, stream):
+    """Split-K tile counters, left zeroed by the kernels: the stream's own when it was prepared (prepare_stream), else those its device's
+    streams share, allocated when the library loads (never inside CUDA graph capture)."""
     if size > _COUNTERS * 4:
         raise RuntimeError("INT8 GEMM split-K counters exceeded")
-    return _counters[device.index]
+    counters = _stream_counters.get(stream)
+    return _counters[device.index] if counters is None else counters
 
 
 def _width(x, act):
@@ -307,9 +320,10 @@ def gemm(a, a_lo, sa, b, sb, bias, out_dtype, split=None, variant=None, out=None
         _lib.wq8_gemm_workspace(m, n, k, variant, sms, split, _sizes)
         slot_bytes, counter_bytes = _sizes[0], _sizes[1]
     slots = torch.empty(slot_bytes, dtype=torch.uint8, device=a.device) if slot_bytes else None
-    counters = _zeroed_counters(a.device, counter_bytes).data_ptr() if counter_bytes else None
+    stream = _stream(a.device)
+    counters = _zeroed_counters(a.device, counter_bytes, stream).data_ptr() if counter_bytes else None
     _check(_lib.wq8_gemm(a.data_ptr(), _ptr(a_lo), sa.data_ptr(), b.data_ptr(), sb.data_ptr(), _ptr(bias), _ptr(residual), _ptr(residual_scale),
-                         y.data_ptr(), m, n, k, _DTYPES[out_dtype], variant, sms, split, _ptr(slots), counters, _stream(a.device)))
+                         y.data_ptr(), m, n, k, _DTYPES[out_dtype], variant, sms, split, _ptr(slots), counters, stream))
     return y
 
 
@@ -321,9 +335,10 @@ def small(x, weight, scale, bias=None, residual=None, residual_scale=None, out=N
     y = torch.empty((m, n), dtype=x.dtype, device=x.device) if out is None else out
     _lib.wq8_small_workspace(m, n, k, sms, _sizes)
     slots = torch.empty(_sizes[0] // 4, dtype=torch.float32, device=x.device) if _sizes[0] else None
-    counters = _zeroed_counters(x.device, _sizes[1]).data_ptr() if _sizes[1] else None
+    stream = _stream(x.device)
+    counters = _zeroed_counters(x.device, _sizes[1], stream).data_ptr() if _sizes[1] else None
     _check(_lib.wq8_small(x.data_ptr(), x.stride(0), weight.data_ptr(), scale.data_ptr(), _ptr(bias), _ptr(residual), _ptr(residual_scale),
-                          y.data_ptr(), m, n, k, _DTYPES[x.dtype], sms, _ptr(slots), counters, _stream(x.device)))
+                          y.data_ptr(), m, n, k, _DTYPES[x.dtype], sms, _ptr(slots), counters, stream))
     return y
 
 

@@ -43,7 +43,8 @@ _a16 = False  # the library has the W8A16 path (wf8_features bit 0)
 _DTYPES = {torch.float16: 0, torch.bfloat16: 1, torch.float32: 2}
 _FP8 = (torch.float8_e4m3fn, torch.uint8, torch.int8)  # E4M3 bytes, or their raw views
 _sms = {}
-_counters = {}
+_counters = {}  # device index -> the split-K counters its streams share
+_stream_counters = {}  # raw stream handle -> the counters of a stream prepared to run beside the others (prepare_stream)
 _sizes = (ctypes.c_int64 * 2)()
 
 
@@ -98,12 +99,24 @@ def _sm_count(device):
     return count
 
 
-def _zeroed_counters(device, size):
-    """Split-K tile counters, allocated when the library loads (never inside CUDA graph capture) and left zeroed by the kernels.
-    Concurrent calls on several streams of one device would share them: use one stream per device."""
+def prepare_stream(stream):
+    """Gives a stream its own split-K counters, so that its GEMMs may run at the same time as those of the device's other streams (the
+    branches of one CUDA graph, for example): the streams not prepared share one set, and two GEMMs running together on it would count
+    each other's tiles. Call it outside CUDA graph capture, before the stream's first GEMM; allocated with the current stream's allocator,
+    zeroed, and synchronized once."""
+    if stream.cuda_stream not in _stream_counters:
+        counters = torch.zeros(_COUNTERS, dtype=torch.int32, device=stream.device)
+        torch.cuda.current_stream(stream.device).synchronize()  # zeroed before the stream or a graph captured on it reads them
+        _stream_counters[stream.cuda_stream] = counters
+
+
+def _zeroed_counters(device, size, stream):
+    """Split-K tile counters, left zeroed by the kernels: the stream's own when it was prepared (prepare_stream), else those its device's
+    streams share, allocated when the library loads (never inside CUDA graph capture)."""
     if size > _COUNTERS * 4:
         raise RuntimeError("FP8 GEMM split-K counters exceeded")
-    return _counters[device.index]
+    counters = _stream_counters.get(stream)
+    return _counters[device.index] if counters is None else counters
 
 
 def a16_supported():
@@ -319,9 +332,10 @@ def gemm(a, sa, b, sb, bias=None, out_dtype=torch.bfloat16, split=None, variant=
         _lib.wf8_gemm_workspace(m, n, k, variant, sms, split, _sizes)
         slot_bytes, counter_bytes = _sizes[0], _sizes[1]
     slots = torch.empty(slot_bytes, dtype=torch.uint8, device=a.device) if slot_bytes else None
-    counters = _zeroed_counters(a.device, counter_bytes).data_ptr() if counter_bytes else None
+    stream = _stream(a.device)
+    counters = _zeroed_counters(a.device, counter_bytes, stream).data_ptr() if counter_bytes else None
     _check(_lib.wf8_gemm(a.data_ptr(), _ptr(sa), b.data_ptr(), sb.data_ptr(), wmode, _ptr(bias), _ptr(residual), _ptr(residual_scale),
-                         y.data_ptr(), m, n, k, _DTYPES[out_dtype], variant, sms, split, _ptr(slots), counters, _stream(a.device)))
+                         y.data_ptr(), m, n, k, _DTYPES[out_dtype], variant, sms, split, _ptr(slots), counters, stream))
     return y
 
 

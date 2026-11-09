@@ -70,17 +70,17 @@ Pick the wheel matching your platform and CUDA stack. A wheel serves every Pytho
 
 ```bash
 # Windows, PyTorch with CUDA 13 (e.g. PyTorch 2.10)
-pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.0/wgpkernels-1.4.0%2Bcu130-py3-none-win_amd64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.3/wgpkernels-1.4.3%2Bcu130-py3-none-win_amd64.whl
 # Windows, PyTorch with CUDA 12.8 (e.g. PyTorch 2.7.1)
-pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.0/wgpkernels-1.4.0%2Bcu128-py3-none-win_amd64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.3/wgpkernels-1.4.3%2Bcu128-py3-none-win_amd64.whl
 # Linux, PyTorch with CUDA 13
-pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.0/wgpkernels-1.4.0%2Bcu130-py3-none-linux_x86_64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.3/wgpkernels-1.4.3%2Bcu130-py3-none-linux_x86_64.whl
 # Linux, PyTorch with CUDA 12.8
-pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.0/wgpkernels-1.4.0%2Bcu128-py3-none-linux_x86_64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.3/wgpkernels-1.4.3%2Bcu128-py3-none-linux_x86_64.whl
 # Windows, AMD RDNA4 with PyTorch 2.13.0 / ROCm 10.0 (experimental)
-pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.0/wgpkernels-1.4.0%2Brocm100-py3-none-win_amd64.whl
+pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.3/wgpkernels-1.4.3%2Brocm100-py3-none-win_amd64.whl
 # Linux, AMD RDNA4 with PyTorch 2.13.0 / ROCm 10.0 (experimental)
-pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.0/wgpkernels-1.4.0%2Brocm100-py3-none-linux_x86_64.whl
+pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.3/wgpkernels-1.4.3%2Brocm100-py3-none-linux_x86_64.whl
 ```
 
 ## Usage
@@ -109,6 +109,9 @@ q = wq.linear_prepared(prepared, weight, scale)
 Activations are 2-D BF16 or FP16 tensors with contiguous rows aligned on 16 bytes; K must be a multiple of 16. Calls are compatible with
 CUDA graph capture once a shape has run eagerly (its tuning is then cached); during capture or `torch.compile` tracing, fixed
 thresholds replace the timing.
+
+The GEMMs of a device share their split-K counters. To run INT8 or FP8 GEMMs at the same time on several streams (concurrent branches
+of a CUDA graph, for example), give each extra stream its own first, outside capture: `wq.prepare_stream(stream)`.
 
 ## FP8 block-scaled linears
 

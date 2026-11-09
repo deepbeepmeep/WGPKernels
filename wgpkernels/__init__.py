@@ -8,4 +8,4 @@ Kernel families:
 - wgpkernels.ops: AdaLN, PixelNorm + SiLU, FP32-accumulating valid Conv3D (CUDA).
 - wgpkernels.attn: block-sparse INT8-QK attention over 64-token tiles for WanGP's VSA (CUDA, SageAttention / SpargeAttn-derived).
 """
-__version__ = "1.4.2"
+__version__ = "1.4.3"
