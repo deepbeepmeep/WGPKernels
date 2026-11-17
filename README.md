@@ -70,17 +70,17 @@ Pick the wheel matching your platform and CUDA stack. A wheel serves every Pytho
 
 ```bash
 # Windows, PyTorch with CUDA 13 (e.g. PyTorch 2.10)
-pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.3/wgpkernels-1.4.3%2Bcu130-py3-none-win_amd64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.0/wgpkernels-1.5.0%2Bcu130-py3-none-win_amd64.whl
 # Windows, PyTorch with CUDA 12.8 (e.g. PyTorch 2.7.1)
-pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.3/wgpkernels-1.4.3%2Bcu128-py3-none-win_amd64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.0/wgpkernels-1.5.0%2Bcu128-py3-none-win_amd64.whl
 # Linux, PyTorch with CUDA 13
-pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.3/wgpkernels-1.4.3%2Bcu130-py3-none-linux_x86_64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.0/wgpkernels-1.5.0%2Bcu130-py3-none-linux_x86_64.whl
 # Linux, PyTorch with CUDA 12.8
-pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.3/wgpkernels-1.4.3%2Bcu128-py3-none-linux_x86_64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.0/wgpkernels-1.5.0%2Bcu128-py3-none-linux_x86_64.whl
 # Windows, AMD RDNA4 with PyTorch 2.13.0 / ROCm 10.0 (experimental)
-pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.3/wgpkernels-1.4.3%2Brocm100-py3-none-win_amd64.whl
+pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.0/wgpkernels-1.5.0%2Brocm100-py3-none-win_amd64.whl
 # Linux, AMD RDNA4 with PyTorch 2.13.0 / ROCm 10.0 (experimental)
-pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.3/wgpkernels-1.4.3%2Brocm100-py3-none-linux_x86_64.whl
+pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.0/wgpkernels-1.5.0%2Brocm100-py3-none-linux_x86_64.whl
 ```
 
 ## Usage
@@ -112,6 +112,12 @@ thresholds replace the timing.
 
 The GEMMs of a device share their split-K counters. To run INT8 or FP8 GEMMs at the same time on several streams (concurrent branches
 of a CUDA graph, for example), give each extra stream its own first, outside capture: `wq.prepare_stream(stream)`.
+
+Inside CUDA graph loops (one captured body replayed for each chunk of rows), the library's `wq8_quantize_at`, `wq8_quantize_blocks_at`
+and `wq8_gemm_at` entry points read their input rows and write their output rows (and the residual's) at `first + counter * step`, the
+counter being an int64 on the GPU that the loop advances: one captured chunk serves every chunk of a long input. A residual scale may
+change by span of rows (a gate per frame). `wq.linear_prepared_segments()` computes 2 to 4 linears of one prepared input in one GEMM
+(the q / k / v projections of a range of heads): the input is read once for all of them (CUDA; `wq.segments_supported()`).
 
 ## FP8 block-scaled linears
 
@@ -160,6 +166,14 @@ attn.load_library()
 kind = attn.kernel_kind(device)   # "fp8", "fp16" or None
 attn.vsa_attention(q_int8, k_int8, v, out, lut, count, valid, q_scale, k_scale, v_scale, sm_scale)
 ```
+
+## Routed experts (GGUF MoE)
+
+`wgpkernels.experts` computes the routed experts (SwiGLU) of a pass of many tokens on INT8 tensor cores, reading GGUF weights in place
+(gate/up IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, Q2_0; down IQ4_NL, Q2_0): activations and the SwiGLU's output become INT8 per 32 values. CUDA SM80+,
+with ideas of Strata (MIT License, https://github.com/Niko1221/Strata).
+`forward_window` does the same for a decoding window of 1 to 8 tokens inside CUDA graphs: routing and copies are read on the GPU at each replay, activations
+take two INT8 per value. The i-quant codebooks come from ggml (MIT License).
 
 ## Building from source
 
@@ -222,6 +236,7 @@ python -m wgpkernels.build                       # every toolkit-supported SM75+
 python -m wgpkernels.build --library ops         # SM80+ targets for activation/convolution kernels
 python -m wgpkernels.build --library fp8         # SM75+ targets for the FP8 kernels (--hip <ROCm SDK root> for RDNA4)
 python -m wgpkernels.build --library attn        # SM80+ targets for the VSA attention kernels (CUDA only)
+python -m wgpkernels.build --library experts     # SM80+ targets for the routed experts kernels (CUDA only)
 python -m wgpkernels.build --arch 120 --verbose  # one architecture, with register and spill report
 python -m wgpkernels.build --hip <ROCm SDK root> # AMD gfx1200 and gfx1201 with ROCm 10's hipcc
 pip install -e .                                 # editable install using the library built in place

@@ -85,6 +85,8 @@ def load_library(path=None):
     lib.wq8_small_workspace.restype = None
     lib.wq8_gemv_lines.argtypes = [p, i64, p, p, p, p, p, p, i, i, i, i, p]
     lib.wq8_rotate_groups.argtypes = [p, p, i, i, i64, i, i, p]
+    if hasattr(lib, "wq8_gemm_segments"):  # CUDA builds
+        lib.wq8_gemm_segments.argtypes = [p, p, p, p, p, p, p, i, i, i, i, i, i, i, i, p, p, p]
     for index in range(torch.cuda.device_count()):
         # ROCm: only the GPUs the library is built for (PyTorch has no kernels for others, e.g. a Ryzen integrated GPU beside the RDNA4 one)
         if torch.version.hip is None or torch.cuda.get_device_properties(index).gcnArchName.split(":")[0] in HIP_ARCHS:
@@ -397,6 +399,35 @@ def linear_prepared(prepared, weight, scale, bias=None, residual=None, residual_
         return small(prepared.x, weight, scale, bias, residual, residual_scale, out)
     return gemm(prepared.x, prepared.lo, prepared.scale, weight, scale, bias, prepared.dtype, out=out, mode=prepared.path, residual=residual,
                 residual_scale=residual_scale)
+
+
+def segments_supported():
+    """Whether the loaded library computes several linears of one input in one GEMM (linear_prepared_segments)."""
+    return _lib is not None and hasattr(_lib, "wq8_gemm_segments")
+
+
+def linear_prepared_segments(prepared, weights, scales, biases, outputs):
+    """outputs[s] = prepared @ (weights[s] * scales[s]).T + biases[s] for 2 to 4 linears in one GEMM ('exact', 'block' or 'row'
+    preparations): weights INT8 (rows, K), each with its rows contiguous; scales FP32 (rows,); biases in the output dtype or None;
+    outputs (M, rows) contiguous in the prepared dtype, rows a multiple of 8. The input is read once for all of them. Each value is the
+    one linear_prepared gives with the launch configuration of N = count * rows."""
+    a, count, rows = prepared.x, len(weights), weights[0].shape[0]
+    m, k = a.shape
+    n = count * rows
+    plan = _plans.get((prepared.path, m, n, k, a.device.index))
+    if plan is None:  # planned (tuned once) as one weight of N rows: the launch's own shape
+        joined = torch.cat(weights)
+        plan = _plan(a, prepared.lo, prepared.scale, joined, torch.cat(scales), None, torch.empty((m, n), dtype=prepared.dtype, device=a.device), prepared.path, False)
+        del joined
+    variant, split, slot_bytes, counter_bytes = plan
+    slots = torch.empty(slot_bytes, dtype=torch.uint8, device=a.device) if slot_bytes else None
+    stream = _stream(a.device)
+    counters = _zeroed_counters(a.device, counter_bytes, stream).data_ptr() if counter_bytes else None
+    pointers = lambda tensors: (ctypes.c_void_p * 4)(*[None if t is None else t.data_ptr() for t in tensors])
+    _check(_lib.wq8_gemm_segments(a.data_ptr(), _ptr(prepared.lo), prepared.scale.data_ptr(), pointers(weights), pointers(scales), pointers(biases),
+                                  pointers(outputs), count, rows, m, k, _DTYPES[prepared.dtype], variant, _sm_count(a.device), split, _ptr(slots),
+                                  counters, stream))
+    return outputs
 
 
 def _gemm_path(x, weight, scale, bias, group, mode, act=None, act_weight=None, eps=0.0, residual=None, residual_scale=None, out=None):

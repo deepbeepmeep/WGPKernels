@@ -235,12 +235,26 @@ DEVICE float cta_sum(float v, float* shared8, int lane, int warp) {
     return s;
 }
 
+// Row offset read on the GPU (a CUDA graph loop's counter): rows first + counter[0] * step of the input or output, 0 without a
+// counter; with span, the residual scales of the rows' span (scale_step values per span of rows: a gate per frame).
+// Set by the *_at entry points for the launches they make (a host thread-local, read at launch into kernel parameters).
+// in_first / in_step (the GEMM): its input rows (A, its low part, its scales) from in_first + counter[0] * in_step.
+struct RowOffset { const long long* counter; long long first, step, span, scale_step, in_first, in_step; };
+DEVICE long long row_shift(const RowOffset& o) { return o.counter ? o.first + __ldg(o.counter) * o.step : 0; }
+static thread_local RowOffset launch_offset = {nullptr, 0, 0, 0, 0, 0, 0};
+
+// Output segments (the GEMM, set by wq8_gemm_segments): the N output columns are N / rows segments of `rows` columns (rows a multiple of
+// 8); segment s computes the weight b[s] (rows, K) with its scales sb[s] and bias bias[s] (or none) into its own output y[s] (M, rows),
+// contiguous: several linears of one input in one launch. rows 0: the GEMM's own b, sb, bias and y.
+struct Segments { int rows; const int8_t* b[4]; const float* sb[4]; const void* bias[4]; void* y[4]; };
+static thread_local Segments launch_segments = {};
+
 // 1 / RMS of each row (RMSNorm rows longer than the register kernels hold): one CTA per row.
 template<class T, int ACT>
-__global__ void __launch_bounds__(256) row_inv_rms(const T* __restrict__ x, float* __restrict__ inv_rms, int k, int64_t ldx, float eps) {
+__global__ void __launch_bounds__(256) row_inv_rms(const T* __restrict__ x, float* __restrict__ inv_rms, int k, int64_t ldx, float eps, RowOffset ro = {}) {
     __shared__ float warp_ss[8];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    const T* row = x + int64_t(blockIdx.x) * ldx;
+    const T* row = x + (int64_t(blockIdx.x) + row_shift(ro)) * ldx;
     float ss = 0.f;
     for (int base = warp * 256; base < k; base += 8 * 256) {
         float v[8];
@@ -254,10 +268,10 @@ __global__ void __launch_bounds__(256) row_inv_rms(const T* __restrict__ x, floa
 
 template<class T, int GROUP, bool HILO, int ACT>
 __global__ void __launch_bounds__(256) quantize_rows(const T* __restrict__ x, int8_t* __restrict__ hi, int8_t* __restrict__ lo,
-                                                     float* __restrict__ scale, int k, int64_t ldx, const T* __restrict__ act_weight, float eps) {
+                                                     float* __restrict__ scale, int k, int64_t ldx, const T* __restrict__ act_weight, float eps, RowOffset ro = {}) {
     __shared__ float warp_max[8], warp_ss[8];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    const T* row = x + int64_t(blockIdx.x) * ldx;
+    const T* row = x + (int64_t(blockIdx.x) + row_shift(ro)) * ldx;
     float inv_rms = 1.f;
     if (ACT == ACT_RMS) {
         float ss = 0.f;
@@ -315,10 +329,10 @@ __global__ void __launch_bounds__(256) quantize_rows(const T* __restrict__ x, in
 // Single pass for K <= 2048 * CPW: each warp keeps its CPW rotated chunks in registers while the row maximum is reduced.
 template<class T, int GROUP, bool HILO, int CPW, int ACT>
 __global__ void __launch_bounds__(256) quantize_rows_registers(const T* __restrict__ x, int8_t* __restrict__ hi, int8_t* __restrict__ lo,
-                                                               float* __restrict__ scale, int k, int64_t ldx, const T* __restrict__ act_weight, float eps) {
+                                                               float* __restrict__ scale, int k, int64_t ldx, const T* __restrict__ act_weight, float eps, RowOffset ro = {}) {
     __shared__ float warp_max[8], warp_ss[8];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    const T* row = x + int64_t(blockIdx.x) * ldx;
+    const T* row = x + (int64_t(blockIdx.x) + row_shift(ro)) * ldx;
     float v[CPW][8];
     float amax = 0.f;
     #pragma unroll
@@ -397,9 +411,10 @@ template<int GROUP> DEVICE void store_chunk_blocks(float* v, int lane, int row, 
 // A warp per 256-element chunk, no row pass; RMSNorm takes the rows' 1 / RMS from row_inv_rms.
 template<class T, int GROUP, int ACT>
 __global__ void __launch_bounds__(256) quantize_blocks(const T* __restrict__ x, int8_t* __restrict__ q, float* __restrict__ scale, int k, int64_t ldx,
-                                                       const T* __restrict__ act_weight, const float* __restrict__ inv_rms) {
+                                                       const T* __restrict__ act_weight, const float* __restrict__ inv_rms, RowOffset ro) {
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, base = (blockIdx.x * 8 + warp) * 256;
     if (base >= k) return;
+    x += row_shift(ro) * ldx;
     const int row = blockIdx.y;
     float v[8];
     load_act<T, ACT>(x + int64_t(row) * ldx, k, base + lane * 8, v, base + lane * 8 < k);
@@ -411,8 +426,9 @@ __global__ void __launch_bounds__(256) quantize_blocks(const T* __restrict__ x, 
 // RMSNorm rows of K <= 2048 * CPW: one CTA per row keeps its chunks in registers while the sum of squares is reduced (one read).
 template<class T, int GROUP, int CPW>
 __global__ void __launch_bounds__(256) quantize_blocks_rms(const T* __restrict__ x, int8_t* __restrict__ q, float* __restrict__ scale, int k, int64_t ldx,
-                                                           const T* __restrict__ act_weight, float eps) {
+                                                           const T* __restrict__ act_weight, float eps, RowOffset ro) {
     __shared__ float warp_ss[8];
+    x += row_shift(ro) * ldx;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, row = blockIdx.x;
     float v[CPW][8], ss = 0.f;
     #pragma unroll
@@ -509,11 +525,12 @@ template<int CHUNKS> DEVICE int swizzle(int r, int c) {
 
 DEVICE int sk_cta_of(long long unit, const Schedule& s) { return int(((unit + 1) * s.sk_ctas - 1) / s.sk_units); }
 
-template<class T, int BM, int BN, int BK, int WM, int WN, int STAGES, bool HILO, int CTAS, bool BLOCKS, bool WGROUP = false>
+template<class T, int BM, int BN, int BK, int WM, int WN, int STAGES, bool HILO, int CTAS, bool BLOCKS, bool WGROUP = false,
+         bool SEG = false>
 __global__ void __launch_bounds__(GemmConfig<BM, BN, BK, WM, WN, STAGES, HILO>::THREADS, CTAS)
 gemm_s8(const int8_t* __restrict__ a, const int8_t* __restrict__ a_lo, const float* __restrict__ sa,
         const int8_t* __restrict__ b, const float* __restrict__ sb, const T* __restrict__ bias, const T* residual, const T* __restrict__ rscale,
-        T* y, int m, int n, int k, Schedule sched, int* __restrict__ workspace, int* __restrict__ counters) {
+        T* y, int m, int n, int k, Schedule sched, int* __restrict__ workspace, int* __restrict__ counters, RowOffset ro, Segments sg) {
     using C = GemmConfig<BM, BN, BK, WM, WN, STAGES, HILO>;
     constexpr int MI = C::MI, NI = C::NI;
     extern __shared__ __align__(128) uint8_t smem[];
@@ -537,6 +554,12 @@ gemm_s8(const int8_t* __restrict__ a, const int8_t* __restrict__ a_lo, const flo
     static_assert(!WGROUP || BM + BN <= C::THREADS, "one thread per scale of a block");
     const int kblocks = (k + 127) / 128;
     int work_m0 = 0, work_n0 = 0, work_kb = 0;
+    if (ro.counter && (ro.in_first || ro.in_step)) {
+        const long long in_shift = ro.in_first + __ldg(ro.counter) * ro.in_step;
+        a += in_shift * k;
+        if (HILO) a_lo += in_shift * k;
+        sa += in_shift * (BLOCKS ? kblocks : 1);
+    }
 
     auto tile_origin = [&](int t, int& m0, int& n0) {
         // Grouped rasterization keeps a band of A rows and the B columns it meets resident in L2.
@@ -587,7 +610,8 @@ gemm_s8(const int8_t* __restrict__ a, const int8_t* __restrict__ a_lo, const flo
         for (int i = 0; i < C::B_PER; ++i) {
             const int r = w.n0 + row0 + i * C::ROW_STEP;
             b_ok[i] = r < n;
-            b_src[i] = b + (b_ok[i] ? int64_t(r) * k + chunk * 16 : 0);
+            if constexpr (SEG) b_src[i] = b_ok[i] ? sg.b[r / sg.rows] + int64_t(r % sg.rows) * k + chunk * 16 : b;
+            else b_src[i] = b + (b_ok[i] ? int64_t(r) * k + chunk * 16 : 0);
         }
     };
     // BLOCKS / WGROUP: the activation / weight scales of k-tile kt's block, with the tile that starts the block (or the work)
@@ -784,12 +808,22 @@ gemm_s8(const int8_t* __restrict__ a, const int8_t* __restrict__ a_lo, const flo
     };
 
     auto epilogue = [&](int m0, int n0) {
+        const long long shift = row_shift(ro);
+        T* const y_at = y + shift * n;
+        const T* const residual_at = residual ? residual + shift * n : nullptr;
         float2 col_scale[NI], col_bias[NI];
         #pragma unroll
         for (int ni = 0; ni < NI; ++ni) {
             const int col = n0 + warp_n * WN + ni * 8 + t4 * 2;
-            col_scale[ni] = WGROUP ? make_float2(1.f, 1.f) : col + 1 < n ? *reinterpret_cast<const float2*>(sb + col) : make_float2(col < n ? sb[col] : 0.f, 0.f);
-            col_bias[ni] = make_float2(bias && col < n ? to_float(bias[col]) : 0.f, bias && col + 1 < n ? to_float(bias[col + 1]) : 0.f);
+            if constexpr (SEG) {  // the segment's scales and bias (col and col + 1 share its segment: rows is even; per-channel weight scales)
+                const float* const sb_col = col < n ? sg.sb[col / sg.rows] + col % sg.rows : sb;
+                const T* const bias_col = col < n && sg.bias[col / sg.rows] ? static_cast<const T*>(sg.bias[col / sg.rows]) + col % sg.rows : nullptr;
+                col_scale[ni] = col + 1 < n ? *reinterpret_cast<const float2*>(sb_col) : make_float2(col < n ? sb_col[0] : 0.f, 0.f);
+                col_bias[ni] = make_float2(bias_col && col < n ? to_float(bias_col[0]) : 0.f, bias_col && col + 1 < n ? to_float(bias_col[1]) : 0.f);
+            } else {
+                col_scale[ni] = WGROUP ? make_float2(1.f, 1.f) : col + 1 < n ? *reinterpret_cast<const float2*>(sb + col) : make_float2(col < n ? sb[col] : 0.f, 0.f);
+                col_bias[ni] = make_float2(bias && col < n ? to_float(bias[col]) : 0.f, bias && col + 1 < n ? to_float(bias[col + 1]) : 0.f);
+            }
         }
         float row_scale[MI][2];
         #pragma unroll
@@ -807,10 +841,10 @@ gemm_s8(const int8_t* __restrict__ a, const int8_t* __restrict__ a_lo, const flo
         // Both outputs of a fragment pair, with the residual (read before the tile is written: y may be the residual itself).
         auto pair = [&](int mi, int ni, int half) {
             float2 v = make_float2(value(mi, ni, half, 0), value(mi, ni, half, 1));
-            if (residual) {
+            if (residual_at) {
                 const int row = m0 + warp_m * WM + mi * 16 + g + half * 8, col = n0 + warp_n * WN + ni * 8 + t4 * 2;
                 if (row < m && col < n) {
-                    const T* r = residual + int64_t(row) * n + col;
+                    const T* r = residual_at + int64_t(row) * n + col;
                     float2 rv;
                     if (col + 1 < n && (n & 1) == 0) {
                         const uint32_t raw = *reinterpret_cast<const uint32_t*>(r);
@@ -819,7 +853,8 @@ gemm_s8(const int8_t* __restrict__ a, const int8_t* __restrict__ a_lo, const flo
                         rv = make_float2(to_float(r[0]), col + 1 < n ? to_float(r[1]) : 0.f);
                     }
                     // residual scales read here, not held per column: the widest tile has no registers to spare
-                    const float rs0 = rscale ? to_float(rscale[col]) : 1.f, rs1 = rscale && col + 1 < n ? to_float(rscale[col + 1]) : 1.f;
+                    const T* const rs_row = rscale && ro.span ? rscale + (shift + row) / ro.span * ro.scale_step : rscale;
+                    const float rs0 = rs_row ? to_float(rs_row[col]) : 1.f, rs1 = rs_row && col + 1 < n ? to_float(rs_row[col + 1]) : 1.f;
                     v.x = fmaf(v.x, rs0, rv.x);
                     v.y = fmaf(v.y, rs1, rv.y);
                 }
@@ -847,7 +882,10 @@ gemm_s8(const int8_t* __restrict__ a, const int8_t* __restrict__ a_lo, const flo
             #pragma unroll 4
             for (int i = tid; i < BM * VECS; i += C::THREADS) {
                 const int r = i / VECS, c = (i % VECS) * 8, row = m0 + r, col = n0 + c;
-                if (row < m && col < n) *reinterpret_cast<uint4*>(y + int64_t(row) * n + col) = *reinterpret_cast<const uint4*>(tile + r * LD + c);
+                if (row < m && col < n) {
+                    if constexpr (SEG) *reinterpret_cast<uint4*>(static_cast<T*>(sg.y[col / sg.rows]) + int64_t(row) * sg.rows + col % sg.rows) = *reinterpret_cast<const uint4*>(tile + r * LD + c);
+                    else *reinterpret_cast<uint4*>(y_at + int64_t(row) * n + col) = *reinterpret_cast<const uint4*>(tile + r * LD + c);
+                }
             }
             __syncthreads();  // the next prologue refills the shared memory
             return;
@@ -858,7 +896,7 @@ gemm_s8(const int8_t* __restrict__ a, const int8_t* __restrict__ a_lo, const flo
             for (int half = 0; half < 2; ++half) {
                 const int row = m0 + warp_m * WM + mi * 16 + g + half * 8;
                 if (row >= m) continue;
-                T* out = y + int64_t(row) * n;
+                T* out = y_at + int64_t(row) * n;
                 #pragma unroll
                 for (int ni = 0; ni < NI; ++ni) {
                     const int col = n0 + warp_n * WN + ni * 8 + t4 * 2;
@@ -1317,11 +1355,11 @@ template<class T, int GROUP, bool HILO, int ACT>
 int launch_quantize(const void* x, int8_t* hi, int8_t* lo, float* scale, int m, int k, int64_t ldx, const void* act_weight, float eps, cudaStream_t stream) {
     auto src = static_cast<const T*>(x);
     auto aw = static_cast<const T*>(act_weight);
-    if (k <= 2048) quantize_rows_registers<T, GROUP, HILO, 1, ACT><<<m, 256, 0, stream>>>(src, hi, lo, scale, k, ldx, aw, eps);
-    else if (k <= 4096) quantize_rows_registers<T, GROUP, HILO, 2, ACT><<<m, 256, 0, stream>>>(src, hi, lo, scale, k, ldx, aw, eps);
-    else if (k <= 8192) quantize_rows_registers<T, GROUP, HILO, 4, ACT><<<m, 256, 0, stream>>>(src, hi, lo, scale, k, ldx, aw, eps);
-    else if (k <= 16384) quantize_rows_registers<T, GROUP, HILO, 8, ACT><<<m, 256, 0, stream>>>(src, hi, lo, scale, k, ldx, aw, eps);
-    else quantize_rows<T, GROUP, HILO, ACT><<<m, 256, 0, stream>>>(src, hi, lo, scale, k, ldx, aw, eps);
+    if (k <= 2048) quantize_rows_registers<T, GROUP, HILO, 1, ACT><<<m, 256, 0, stream>>>(src, hi, lo, scale, k, ldx, aw, eps, launch_offset);
+    else if (k <= 4096) quantize_rows_registers<T, GROUP, HILO, 2, ACT><<<m, 256, 0, stream>>>(src, hi, lo, scale, k, ldx, aw, eps, launch_offset);
+    else if (k <= 8192) quantize_rows_registers<T, GROUP, HILO, 4, ACT><<<m, 256, 0, stream>>>(src, hi, lo, scale, k, ldx, aw, eps, launch_offset);
+    else if (k <= 16384) quantize_rows_registers<T, GROUP, HILO, 8, ACT><<<m, 256, 0, stream>>>(src, hi, lo, scale, k, ldx, aw, eps, launch_offset);
+    else quantize_rows<T, GROUP, HILO, ACT><<<m, 256, 0, stream>>>(src, hi, lo, scale, k, ldx, aw, eps, launch_offset);
     return int(cudaGetLastError());
 }
 
@@ -1351,6 +1389,18 @@ int dispatch_quantize_act(const void* x, int8_t* hi, int8_t* lo, float* scale, i
 // Row INT8 of op(x): dtype 0 = FP16, 1 = BF16, 2 = FP32 (no input operation). K must be a multiple of 8 and of the group; rows are
 // 16-byte aligned. act: 0 none, 1 RMSNorm (act_weight: K values of x's dtype or null), 2 SwiGLU (x rows hold 2K values: gate | value),
 // 3 GELU (tanh approximation).
+API int wq8_quantize(const void* x, int8_t* hi, int8_t* lo, float* scale, int m, int k, int64_t ldx, int dtype, int group, int act,
+                     const void* act_weight, float eps, cudaStream_t stream);
+
+// wq8_quantize reading rows first + counter[0] * step of x: counter on the GPU, read at run time.
+API int wq8_quantize_at(const void* x, int8_t* hi, int8_t* lo, float* scale, int m, int k, int64_t ldx, int dtype, int group, int act,
+                        const void* act_weight, float eps, const long long* counter, long long first, long long step, cudaStream_t stream) {
+    launch_offset = {counter, first, step, 0, 0, 0, 0};
+    const int code = wq8_quantize(x, hi, lo, scale, m, k, ldx, dtype, group, act, act_weight, eps, stream);
+    launch_offset = {nullptr, 0, 0, 0, 0, 0, 0};
+    return code;
+}
+
 API int wq8_quantize(const void* x, int8_t* hi, int8_t* lo, float* scale, int m, int k, int64_t ldx, int dtype, int group, int act,
                      const void* act_weight, float eps, cudaStream_t stream) {
     if (!m) return 0;
@@ -1482,15 +1532,20 @@ int launch_gemm(const int8_t* a, const int8_t* a_lo, const float* sa, const int8
                 const void* rscale, void* y, int m, int n, int k, int sms, int split, int* workspace, int* counters, cudaStream_t stream) {
     using V = Variant<VI>;
     using C = GemmConfig<V::BM, V::BN, V::BK, V::WM, V::WN, V::STAGES, V::HILO>;
-    auto kernel = gemm_s8<T, V::BM, V::BN, V::BK, V::WM, V::WN, V::STAGES, V::HILO, V::CTAS, V::BLOCKS, V::WGROUP>;
+    // segments (wq8_gemm_segments, per-channel weight scales) use their own instantiation: the plain kernel compiles as without them
+    auto plain = gemm_s8<T, V::BM, V::BN, V::BK, V::WM, V::WN, V::STAGES, V::HILO, V::CTAS, V::BLOCKS, V::WGROUP, false>;
+    auto segmented = gemm_s8<T, V::BM, V::BN, V::BK, V::WM, V::WN, V::STAGES, V::HILO, V::CTAS, V::BLOCKS, V::WGROUP, !V::WGROUP>;
+    if (V::WGROUP && launch_segments.rows) return -4;  // weights with per-block scales have no segmented form
     static bool configured = false;
     if (!configured) {
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM);
+        cudaFuncSetAttribute(plain, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM);
+        cudaFuncSetAttribute(segmented, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM);
         configured = true;
     }
+    auto kernel = launch_segments.rows ? segmented : plain;
     const Schedule s = make_schedule<V>(m, n, k, sms, split);
     kernel<<<s.grid, C::THREADS, C::SMEM, stream>>>(a, a_lo, sa, b, sb, static_cast<const T*>(bias), static_cast<const T*>(residual),
-                                                    static_cast<const T*>(rscale), static_cast<T*>(y), m, n, k, s, workspace, counters);
+                                                    static_cast<const T*>(rscale), static_cast<T*>(y), m, n, k, s, workspace, counters, launch_offset, launch_segments);
     return int(cudaGetLastError());
 }
 
@@ -1573,6 +1628,25 @@ template<class T> int dispatch_gemm(const int8_t* a, const int8_t* a_lo, const f
 
 API int wq8_gemm(const int8_t* a, const int8_t* a_lo, const float* sa, const int8_t* b, const float* sb, const void* bias, const void* residual,
                  const void* rscale, void* y, int m, int n, int k, int dtype, int variant, int sms, int split, int* workspace, int* counters,
+                 cudaStream_t stream);
+
+#if !WGP_AMD  // the HIP GEMM has no row offsets: its library has no wq8_gemm_at
+// wq8_gemm writing rows first + counter[0] * step of y (and reading those of the residual): counter on the GPU, read at run time.
+// span > 0: rscale holds scale_step values per span of rows (a gate per frame), read for the rows' span.
+// in_first / in_step: its input rows (A, its low part, its scales) from in_first + counter[0] * in_step.
+API int wq8_gemm_at(const int8_t* a, const int8_t* a_lo, const float* sa, const int8_t* b, const float* sb, const void* bias, const void* residual,
+                    const void* rscale, void* y, int m, int n, int k, int dtype, int variant, int sms, int split, int* workspace, int* counters,
+                    const long long* counter, long long first, long long step, long long span, long long scale_step, long long in_first, long long in_step,
+                    cudaStream_t stream) {
+    launch_offset = {counter, first, step, span, scale_step, in_first, in_step};
+    const int code = wq8_gemm(a, a_lo, sa, b, sb, bias, residual, rscale, y, m, n, k, dtype, variant, sms, split, workspace, counters, stream);
+    launch_offset = {nullptr, 0, 0, 0, 0, 0, 0};
+    return code;
+}
+#endif
+
+API int wq8_gemm(const int8_t* a, const int8_t* a_lo, const float* sa, const int8_t* b, const float* sb, const void* bias, const void* residual,
+                 const void* rscale, void* y, int m, int n, int k, int dtype, int variant, int sms, int split, int* workspace, int* counters,
                  cudaStream_t stream) {
     if (!m || !n) return 0;
     if ((variant == 1 || variant == 7 || variant == 14 || variant == 114) != (a_lo != nullptr)) return -2;
@@ -1580,6 +1654,27 @@ API int wq8_gemm(const int8_t* a, const int8_t* a_lo, const float* sa, const int
     if (dtype == 1) return dispatch_gemm<__nv_bfloat16>(a, a_lo, sa, b, sb, bias, residual, rscale, y, m, n, k, variant, sms, split, workspace, counters, stream);
     return -1;
 }
+
+#if !WGP_AMD
+// wq8_gemm of `count` (1 to 4) linears of one input in one launch: weights bs[s] (rows, K) with their scales sbs[s] and biases biases[s]
+// (null entries: no bias), outputs ys[s] (M, rows), contiguous, rows a multiple of 8. N = count * rows plans the launch
+// (wq8_gemm_workspace, variant). The q / k / v projections of a range of heads in one GEMM: the input is read once instead of once
+// per projection (an input larger than the L2 cache is otherwise read again from VRAM by each). No residual, no row offset.
+API int wq8_gemm_segments(const int8_t* a, const int8_t* a_lo, const float* sa, const int8_t* const* bs, const float* const* sbs, const void* const* biases,
+                          void* const* ys, int count, int rows, int m, int k, int dtype, int variant, int sms, int split, int* workspace, int* counters,
+                          cudaStream_t stream) {
+    if (count < 1 || count > 4 || rows <= 0 || rows % 8) return -4;
+    launch_segments = {};
+    launch_segments.rows = rows;
+    for (int s = 0; s < count; ++s) {
+        launch_segments.b[s] = bs[s]; launch_segments.sb[s] = sbs[s]; launch_segments.bias[s] = biases[s]; launch_segments.y[s] = ys[s];
+    }
+    const int code = wq8_gemm(a, a_lo, sa, bs[0], sbs[0], nullptr, nullptr, nullptr, ys[0], m, count * rows, k, dtype, variant, sms, split, workspace,
+                              counters, stream);
+    launch_segments = {};
+    return code;
+}
+#endif
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Few tokens: K must be a multiple of 64, at most 32 tokens. splits: K split over CTAs so that every SM streams weights.
@@ -1783,18 +1878,18 @@ API int wq8_rotate_groups(const void* x, void* out, int m, int k, int64_t ldx, i
 template<class T, int GROUP, int ACT>
 int launch_quantize_blocks(const T* x, int8_t* q, float* scale, int m, int k, int64_t ldx, const T* aw, float eps, float* inv_rms, cudaStream_t stream) {
     if (ACT == ACT_RMS && k <= 16384) {
-        if (k <= 2048) quantize_blocks_rms<T, GROUP, 1><<<m, 256, 0, stream>>>(x, q, scale, k, ldx, aw, eps);
-        else if (k <= 4096) quantize_blocks_rms<T, GROUP, 2><<<m, 256, 0, stream>>>(x, q, scale, k, ldx, aw, eps);
-        else if (k <= 8192) quantize_blocks_rms<T, GROUP, 4><<<m, 256, 0, stream>>>(x, q, scale, k, ldx, aw, eps);
-        else quantize_blocks_rms<T, GROUP, 8><<<m, 256, 0, stream>>>(x, q, scale, k, ldx, aw, eps);
+        if (k <= 2048) quantize_blocks_rms<T, GROUP, 1><<<m, 256, 0, stream>>>(x, q, scale, k, ldx, aw, eps, launch_offset);
+        else if (k <= 4096) quantize_blocks_rms<T, GROUP, 2><<<m, 256, 0, stream>>>(x, q, scale, k, ldx, aw, eps, launch_offset);
+        else if (k <= 8192) quantize_blocks_rms<T, GROUP, 4><<<m, 256, 0, stream>>>(x, q, scale, k, ldx, aw, eps, launch_offset);
+        else quantize_blocks_rms<T, GROUP, 8><<<m, 256, 0, stream>>>(x, q, scale, k, ldx, aw, eps, launch_offset);
         return int(cudaGetLastError());
     }
     if (ACT == ACT_RMS) {
         if (!inv_rms) return -2;
-        row_inv_rms<T, ACT_NONE><<<m, 256, 0, stream>>>(x, inv_rms, k, ldx, eps);
+        row_inv_rms<T, ACT_NONE><<<m, 256, 0, stream>>>(x, inv_rms, k, ldx, eps, launch_offset);
     }
     const dim3 grid((k + 2047) / 2048, m);
-    quantize_blocks<T, GROUP, ACT><<<grid, 256, 0, stream>>>(x, q, scale, k, ldx, aw, inv_rms);
+    quantize_blocks<T, GROUP, ACT><<<grid, 256, 0, stream>>>(x, q, scale, k, ldx, aw, inv_rms, launch_offset);
     return int(cudaGetLastError());
 }
 
@@ -1822,6 +1917,18 @@ int dispatch_quantize_blocks_act(const void* x, int8_t* q, float* scale, int m, 
         case ACT_GELU: return dispatch_quantize_blocks<T, ACT_GELU>(x, q, scale, m, k, ldx, group, aw, eps, inv_rms, stream);
     }
     return -1;
+}
+
+API int wq8_quantize_blocks(const void* x, int8_t* q, float* scale, int m, int k, int64_t ldx, int dtype, int group, int act, const void* act_weight,
+                            float eps, float* inv_rms, cudaStream_t stream);
+
+// wq8_quantize_blocks reading rows first + counter[0] * step of x: counter on the GPU, read at run time.
+API int wq8_quantize_blocks_at(const void* x, int8_t* q, float* scale, int m, int k, int64_t ldx, int dtype, int group, int act, const void* act_weight,
+                               float eps, float* inv_rms, const long long* counter, long long first, long long step, cudaStream_t stream) {
+    launch_offset = {counter, first, step, 0, 0, 0, 0};
+    const int code = wq8_quantize_blocks(x, q, scale, m, k, ldx, dtype, group, act, act_weight, eps, inv_rms, stream);
+    launch_offset = {nullptr, 0, 0, 0, 0, 0, 0};
+    return code;
 }
 
 // Per-block INT8 of op(x) (optionally ConvRot-rotated): q (M, K), scale (M, ceil(K / 128)). M at most 65535 per call. act as wq8_quantize;

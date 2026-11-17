@@ -7,5 +7,6 @@ Kernel families:
 - wgpkernels.fp8: FP8 (E4M3) block-scaled linears for FP8 checkpoints (DeepGEMM / CUTLASS GemmBlockwise semantics).
 - wgpkernels.ops: AdaLN, PixelNorm + SiLU, FP32-accumulating valid Conv3D (CUDA).
 - wgpkernels.attn: block-sparse INT8-QK attention over 64-token tiles for WanGP's VSA (CUDA, SageAttention / SpargeAttn-derived).
+- wgpkernels.experts: routed experts of GGUF checkpoints on INT8 tensor cores, for passes of many tokens (CUDA).
 """
-__version__ = "1.4.3"
+__version__ = "1.5.0"
