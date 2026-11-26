@@ -29,10 +29,14 @@ import ctypes
 import functools
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
 import torch
+from tqdm import tqdm
+
+import wgpkernels
 
 SCRATCH_BYTES = 16 * 1024 * 1024
 WS_BLOCK, WS_CHANNEL, WS_TENSOR, WS_GROUP = 0, 1, 2, 3  # weight scale granularity
@@ -227,7 +231,7 @@ def _save_cache():
         _TUNING_PATH.parent.mkdir(parents=True, exist_ok=True)
         _TUNING_PATH.write_text(json.dumps({"version": _TUNING_VERSION, "configs": _tuned}, indent=1), encoding="utf-8")
     except OSError as error:
-        print(f"[FP8] Could not save the FP8 GEMM tuning cache {_TUNING_PATH}: {error}")
+        tqdm.write(f"[FP8] Could not save the FP8 GEMM tuning cache {_TUNING_PATH}: {error}")
 
 
 def _best_of(launches, device):
@@ -270,16 +274,21 @@ def _tuned_config(a, sa, b, sb, y, a16=False):
         return tuple(config), True
     if torch.cuda.is_current_stream_capturing() or torch.compiler.is_compiling():
         return ((_lib.wf8_gemm_select_a16 if a16 else _lib.wf8_gemm_select)(m, n, k, _sm_count(b.device)), 1), False
-    started = time.time()
-    label = f"FP8 GEMM {m}x{n}x{k} ({kernel_path()}{', 16-bit activations' if a16 else ''})"
-    print(f"[WGPKernels] Autotuning {label}...", flush=True)
+    log = wgpkernels.verbose_level >= 2
+    if log:
+        started = time.time()
+        label = f"FP8 GEMM {m}x{n}x{k} ({kernel_path()}{', 16-bit activations' if a16 else ''})"
+        tqdm.write(f"[WGPKernels] Autotuning {label}...")
+        sys.stdout.flush()
     candidates = (_CANDIDATES_A16 if a16 else _CANDIDATES) if torch.version.hip is None else ((1, 0),)  # AMD: one tile, no stream-K
     timings = _best_of({config: (lambda config: lambda: gemm(a, sa, b, sb, None, y.dtype, config[1], config[0], y, a16=a16))(config)
                         for config in candidates}, b.device)
     best_ms, best = min((ms, config) for config, ms in timings.items())
     _tuned[key] = list(best)
     _save_cache()
-    print(f"[WGPKernels] Selected {label}: tiles {best[0]}, split {best[1]} ({best_ms * 1000:.1f} us; tuned in {time.time() - started:.2f} s).", flush=True)
+    if log:
+        tqdm.write(f"[WGPKernels] Selected {label}: tiles {best[0]}, split {best[1]} ({best_ms * 1000:.1f} us; tuned in {time.time() - started:.2f} s).")
+        sys.stdout.flush()
     return best, True
 
 

@@ -9,4 +9,5 @@ Kernel families:
 - wgpkernels.attn: block-sparse INT8-QK attention over 64-token tiles for WanGP's VSA (CUDA, SageAttention / SpargeAttn-derived).
 - wgpkernels.experts: routed experts of GGUF checkpoints on INT8 tensor cores, for passes of many tokens (CUDA).
 """
-__version__ = "1.5.0"
+__version__ = "1.5.1"
+verbose_level = 1  # At 2 and above the autotuners report their searches and selected configurations.

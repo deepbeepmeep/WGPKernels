@@ -29,8 +29,10 @@ Group-quantized INT8 checkpoints, with one FP32 scale per output channel and 128
 example Hunyuan's group-128 INT8 DiT), run the `exact` and `block` paths: each block's exact INT32 sums are scaled by their weight scale
 (and activation block scale) into FP32 accumulators. `linear()` takes such scales directly; the few-token paths need per-channel scales.
 
-Autotuning prints a start message and the selected choice, without listing candidate timings or nested tile searches. Cache hits are
-silent and survive restarts. INT8 path selection uses exact token counts through 16, groups of 8 through 128, then groups of 64 through
+WanGP passes its `--verbose` level to WGPKernels at startup. At level 2 or higher, each new autotuning search
+prints a start message and its selected configuration. Levels 0 and 1 tune silently. In standalone Python,
+set `wgpkernels.verbose_level = 2` after `import wgpkernels` to enable these messages. The default is 1.
+Cache hits are silent at every level and survive restarts. INT8 path selection uses exact token counts through 16, groups of 8 through 128, then groups of 64 through
 4096. GEMM tile selection uses groups of 64 through 4096, then buckets of 8192 and 16384; larger inputs reuse the 16384 bucket. Layer
 widths remain distinct, and path choices also distinguish ConvRot groups, fused input operations and `precise=True`. In ordinary mode,
 inputs above 4096 tokens use `block` directly. The first input in a bucket supplies the measurements reused for that bucket.
@@ -70,17 +72,17 @@ Pick the wheel matching your platform and CUDA stack. A wheel serves every Pytho
 
 ```bash
 # Windows, PyTorch with CUDA 13 (e.g. PyTorch 2.10)
-pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.0/wgpkernels-1.5.0%2Bcu130-py3-none-win_amd64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.1/wgpkernels-1.5.1%2Bcu130-py3-none-win_amd64.whl
 # Windows, PyTorch with CUDA 12.8 (e.g. PyTorch 2.7.1)
-pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.0/wgpkernels-1.5.0%2Bcu128-py3-none-win_amd64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.1/wgpkernels-1.5.1%2Bcu128-py3-none-win_amd64.whl
 # Linux, PyTorch with CUDA 13
-pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.0/wgpkernels-1.5.0%2Bcu130-py3-none-linux_x86_64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.1/wgpkernels-1.5.1%2Bcu130-py3-none-linux_x86_64.whl
 # Linux, PyTorch with CUDA 12.8
-pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.0/wgpkernels-1.5.0%2Bcu128-py3-none-linux_x86_64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.1/wgpkernels-1.5.1%2Bcu128-py3-none-linux_x86_64.whl
 # Windows, AMD RDNA4 with PyTorch 2.13.0 / ROCm 10.0 (experimental)
-pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.0/wgpkernels-1.5.0%2Brocm100-py3-none-win_amd64.whl
+pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.1/wgpkernels-1.5.1%2Brocm100-py3-none-win_amd64.whl
 # Linux, AMD RDNA4 with PyTorch 2.13.0 / ROCm 10.0 (experimental)
-pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.0/wgpkernels-1.5.0%2Brocm100-py3-none-linux_x86_64.whl
+pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.1/wgpkernels-1.5.1%2Brocm100-py3-none-linux_x86_64.whl
 ```
 
 ## Usage

@@ -29,11 +29,15 @@ import ctypes
 import functools
 import json
 import os
+import sys
 import time
 from contextvars import ContextVar
 from pathlib import Path
 
 import torch
+from tqdm import tqdm
+
+import wgpkernels
 
 SCRATCH_BYTES = 16 * 1024 * 1024
 # The block quantizer and group rotation put token rows on CUDA's grid Y axis.
@@ -213,7 +217,7 @@ def _save_cache():
         _TUNING_PATH.parent.mkdir(parents=True, exist_ok=True)
         _TUNING_PATH.write_text(json.dumps({"version": _TUNING_VERSION, "configs": _tuned}, indent=1), encoding="utf-8")
     except OSError as error:
-        print(f"[INT8] Could not save the INT8 GEMM tuning cache {_TUNING_PATH}: {error}")
+        tqdm.write(f"[INT8] Could not save the INT8 GEMM tuning cache {_TUNING_PATH}: {error}")
 
 
 def _best_of(launches, device):
@@ -258,18 +262,20 @@ def _tuned_config(a, a_lo, sa, b, sb, bias, y, mode):
         if mode in ('block', 'block+g', 'exact+g'):
             return _CANDIDATES[mode][0], False
         return (_lib.wq8_gemm_select(m, n, k, mode == 'exact', _sm_count(b.device)), 1), False
-    started = time.time()
-    log = not _path_tuning.get()
-    label = f"INT8 GEMM {mode} {m}x{n}x{k}"
+    log = wgpkernels.verbose_level >= 2 and not _path_tuning.get()
     if log:
-        print(f"[WGPKernels] Autotuning {label}...", flush=True)
+        started = time.time()
+        label = f"INT8 GEMM {mode} {m}x{n}x{k}"
+        tqdm.write(f"[WGPKernels] Autotuning {label}...")
+        sys.stdout.flush()
     timings = _best_of({config: (lambda config: lambda: gemm(a, a_lo, sa, b, sb, bias, y.dtype, config[1], config[0], y))(config)
                         for config in _CANDIDATES[mode]}, b.device)
     best_ms, best = min((ms, config) for config, ms in timings.items())
     _tuned[key] = list(best)
     _save_cache()
     if log:
-        print(f"[WGPKernels] Selected {label}: tiles {best[0]}, split {best[1]} ({best_ms * 1000:.1f} us; tuned in {time.time() - started:.2f} s).", flush=True)
+        tqdm.write(f"[WGPKernels] Selected {label}: tiles {best[0]}, split {best[1]} ({best_ms * 1000:.1f} us; tuned in {time.time() - started:.2f} s).")
+        sys.stdout.flush()
     return best, True
 
 
@@ -491,9 +497,12 @@ def choose_path(x, weight, scale, bias=None, group=0, precise=False, act=None, a
     if torch.cuda.is_current_stream_capturing() or torch.compiler.is_compiling():
         return _static_path(m, k, precise, groups)
     candidates = _precise_paths(m, k, groups) + ([] if precise else ['block'])
-    label = f"INT8 path {m}x{n}x{k}{f' ConvRot {group}' if group else ''}{f' {act}' if act else ''}{' (precise)' if precise else ''}"
-    started = time.time()
-    print(f"[WGPKernels] Autotuning {label}...", flush=True)
+    log = wgpkernels.verbose_level >= 2
+    if log:
+        label = f"INT8 path {m}x{n}x{k}{f' ConvRot {group}' if group else ''}{f' {act}' if act else ''}{' (precise)' if precise else ''}"
+        started = time.time()
+        tqdm.write(f"[WGPKernels] Autotuning {label}...")
+        sys.stdout.flush()
     token = _path_tuning.set(True)
     try:
         timings = _best_of({path: (lambda path: lambda: _run(path, x, weight, scale, bias, group, act, act_weight, eps))(path) for path in candidates},
@@ -505,7 +514,9 @@ def choose_path(x, weight, scale, bias=None, group=0, precise=False, act=None, a
         path = 'block'
     _tuned[key] = _paths[shape] = path
     _save_cache()
-    print(f"[WGPKernels] Selected {label}: {path} ({timings[path] * 1000:.1f} us; tuned in {time.time() - started:.2f} s).", flush=True)
+    if log:
+        tqdm.write(f"[WGPKernels] Selected {label}: {path} ({timings[path] * 1000:.1f} us; tuned in {time.time() - started:.2f} s).")
+        sys.stdout.flush()
     return path
 
 

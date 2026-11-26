@@ -9,11 +9,15 @@ caching it, leaving the next eager call free to tune.
 import functools
 import json
 import os
+import sys
 import threading
 import time
 from pathlib import Path
 
 import torch
+from tqdm import tqdm
+
+import wgpkernels
 
 VERSION = 1  # Bump for kernel, candidates, key or benchmark changes.
 MAX_ENTRIES = 4096
@@ -51,7 +55,7 @@ def _save():
         temporary.write_text(json.dumps({'version': VERSION, 'entries': _entries}, indent=1), encoding='utf-8')
         temporary.replace(_path)
     except OSError as error:
-        print(f'[Kernels] Could not save native CUDA tuning: {error}')
+        tqdm.write(f'[Kernels] Could not save native CUDA tuning: {error}')
     finally:
         try:
             temporary.unlink(missing_ok=True)
@@ -81,8 +85,11 @@ def choose(operation, identity, device_index, candidates, launch):
         if isinstance(entry, dict) and entry.get('config') in candidates:
             best = entry['config']
         else:
-            started = time.perf_counter()
-            print(f'[WGPKernels] Autotuning CUDA {operation}...', flush=True)
+            log = wgpkernels.verbose_level >= 2
+            if log:
+                started = time.perf_counter()
+                tqdm.write(f'[WGPKernels] Autotuning CUDA {operation}...')
+                sys.stdout.flush()
             timings = {config: float('inf') for config in candidates}
             for config in candidates:
                 launch(config)
@@ -103,7 +110,9 @@ def choose(operation, identity, device_index, candidates, launch):
                 best = candidates[0]
             _entries[stored_key] = {'config': best, 'milliseconds': timings}
             _save()
-            print(f'[WGPKernels] Selected CUDA {operation}: configuration {best} ({timings[best] * 1000:.1f} us; tuned in {time.perf_counter() - started:.2f} s).', flush=True)
+            if log:
+                tqdm.write(f'[WGPKernels] Selected CUDA {operation}: configuration {best} ({timings[best] * 1000:.1f} us; tuned in {time.perf_counter() - started:.2f} s).')
+                sys.stdout.flush()
         if len(_plans) >= MAX_ENTRIES:
             _plans.clear()
         _plans[key] = best
